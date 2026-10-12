@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-only
-# Undo install.sh:  bash x4r/uninstall.sh [--prefix DIR]   (then delete igdext64.dll and the x4r folder from the game folder)
+# Undo what x4r did outside the game folder:  bash plugins/x4r/uninstall.sh [--prefix DIR]
+# Afterwards delete dxgi.dll, OptiScaler.ini, libxess.dll, the plugins folder and Licenses from the game folder.
 set -euo pipefail
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-GAME=$(dirname -- "$HERE")
+GAME=$(dirname -- "$(dirname -- "$HERE")")
 PFX=''
 [[ ${1:-} != --prefix ]] || PFX=${2:?--prefix needs a directory}
 if [[ -z $PFX ]]; then
@@ -21,7 +22,7 @@ SYS=$PFX/drive_c/windows/system32
 if [[ -e $SYS/igdext64.dll.x4r-backup || -L $SYS/igdext64.dll.x4r-backup ]]; then
   rm -f -- "$SYS/igdext64.dll"; mv -- "$SYS/igdext64.dll.x4r-backup" "$SYS/igdext64.dll"; echo "Restored Proton's igdext64.dll"
 else
-  echo 'No backup found; Proton restores its own igdext64.dll when the prefix is next updated (or delete the prefix copy by hand).'
+  echo 'No backup found; Proton restores its own igdext64.dll when the prefix is next updated.'
 fi
 if [[ -f $GAME/dxvk.conf ]] && grep -q '^# x4r begin' "$GAME/dxvk.conf"; then
   sed -i '/^# x4r begin/,/^# x4r end/d' "$GAME/dxvk.conf"; [[ -s $GAME/dxvk.conf ]] || rm -f "$GAME/dxvk.conf"; echo 'Removed the x4r block from dxvk.conf'
