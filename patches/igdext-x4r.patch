@@ -40,7 +40,7 @@ index 81537c5..761e4e1 100644
      return S_OK;
  }
 diff --git a/src/Trace.cpp b/src/Trace.cpp
-index 8ad64cc..f6efcdf 100644
+index 8ad64cc..2df7a7c 100644
 --- a/src/Trace.cpp
 +++ b/src/Trace.cpp
 @@ -59,21 +59,27 @@ bool DumpBlob(const char* name, const void* data, size_t size)
@@ -66,38 +66,40 @@ index 8ad64cc..f6efcdf 100644
  
  void StartXellHook();
 -BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID)
-+extern "C" void X4rInit(HMODULE self);   // x4r
++extern "C" bool X4rInit(HMODULE self);   // x4r
 +BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
  {
      if (reason == DLL_PROCESS_ATTACH)
      {
          char exe[MAX_PATH] = {}; GetModuleFileNameA(nullptr, exe, MAX_PATH);
          TraceF("==== igdext64 (tracing build) attached to %s", exe);
-+        X4rInit(inst);   // x4r
++        if (X4rInit(inst)) return TRUE;   // x4r: loaded as the OptiScaler plugin, not as the shim
          StartXellHook();
      }
      return TRUE;
 diff --git a/src/dll/D3D12Api.cpp b/src/dll/D3D12Api.cpp
-index 71520b4..42503b7 100644
+index 71520b4..755b046 100644
 --- a/src/dll/D3D12Api.cpp
 +++ b/src/dll/D3D12Api.cpp
-@@ -80,6 +80,11 @@ static int DynKernelId(unsigned long long hash, const void* spv, size_t spvLen,
+@@ -80,6 +80,12 @@ static int DynKernelId(unsigned long long hash, const void* spv, size_t spvLen,
      LeaveCriticalSection(&g_dynCs);
      return id;
  }
 +bool X4rKernelBytecode(unsigned long long kernelHash, D3D12_SHADER_BYTECODE* out);   // x4r
 +unsigned long long X4rRootSigHash(ID3D12RootSignature* rs);
++extern "C" void X4rCaptureNote(unsigned long long kernelHash, unsigned long long rsHash);
 +extern "C" void X4rKernelFailed(unsigned long long kernelHash, const char* why);
 +extern "C" int X4rGate();
 +extern "C" void X4rNotePipeline(ID3D12PipelineState* pso, unsigned long long kernelHash);
  static ID3D12Device* DevOf(INTCExtensionContext* c) { return (c && c->m_pD3D12ExtensionContext) ? c->m_pD3D12ExtensionContext->m_pAppDevice.Get() : nullptr; }
  
  
-@@ -239,6 +244,22 @@ HRESULT _INTC_D3D12_CreateComputePipelineState(INTCExtensionContext* ctx, const
+@@ -239,6 +245,23 @@ HRESULT _INTC_D3D12_CreateComputePipelineState(INTCExtensionContext* ctx, const
              if (useStatic) for (const XessDummy& xd : kXessDummies)
                  if (xd.hash == h) { desc.CS.pShaderBytecode = xd.bytes; desc.CS.BytecodeLength = xd.size; TraceF("  kernel hash %016llx -> dummy id %d (workgroup %d,%d,5)", h, xd.id, 1 + xd.id % 16, 1 + xd.id / 16); known = true; break; }
  #endif
 +            TraceF("  x4r: kernel %016llx rootsig %016llx", h, X4rRootSigHash(d->pD3D12Desc->pRootSignature));
++            if (GetEnvironmentVariableA("X4R_CAPTURE", nullptr, 0)) X4rCaptureNote(h, X4rRootSigHash(d->pD3D12Desc->pRootSignature));
 +            if (!known && d->ShaderInputType == CM_SPIRV && X4rKernelBytecode(h, &desc.CS))
 +            {
 +                // x4r: a translated kernel exists: run it for real
@@ -108,7 +110,7 @@ index 71520b4..42503b7 100644
 +                X4rKernelFailed(h, "translated pipeline rejected");
 +                return xhr;
 +            }
-+            if (!known && d->ShaderInputType == CM_SPIRV && X4rGate() > 0)
++            if (!known && d->ShaderInputType == CM_SPIRV && X4rGate() > 0 && !GetEnvironmentVariableA("X4R_CAPTURE", nullptr, 0))   // X4R_CAPTURE: record new kernels instead
 +            {
 +                X4rKernelFailed(h, "no translation for this kernel");
 +                return E_FAIL;
@@ -116,7 +118,7 @@ index 71520b4..42503b7 100644
              if (!known && d->ShaderInputType == CM_SPIRV)
              {
                  const int dyn = DynKernelId(h, d->CS.pShaderBytecode, d->CS.BytecodeLength, opts);
-@@ -290,10 +311,12 @@ static bool CalledFromXeFG()
+@@ -290,10 +313,12 @@ static bool CalledFromXeFG()
  // If the file is not newer than this process, placeholders would not be replaced - the stock driver is in use (the
  // session check fell back, the variables are missing) or vkd3d-proton changed how placeholders reach the driver - and
  // XeSS must use its DP4a path instead of producing noise. IGDEXT_SKIP_SELFTEST=1 skips it.
@@ -151,10 +153,10 @@ index 52f2a49..ffab72e 100644
          *pSupportedExtVersionsCount = NumSupportedVersions;
 diff --git a/src/dll/X4r.cpp b/src/dll/X4r.cpp
 new file mode 100644
-index 0000000..7d7ab96
+index 0000000..6896073
 --- /dev/null
 +++ b/src/dll/X4r.cpp
-@@ -0,0 +1,494 @@
+@@ -0,0 +1,583 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +// x4r: AMD backend for XeSS' CM kernels.
 +//  * hooks the D3D12 device to record XeSS' root signatures and descriptor views (so translated kernels can declare
@@ -248,6 +250,10 @@ index 0000000..7d7ab96
 +// everything else falls back to the stock DXIL, which needs only dot4.
 +void SelectOverrides()
 +{
++    if (IniValue("Backend") == "dp4a")      // x4r.ini: stock DP4a XeSS under the same host setup (for A/B comparisons)
++    { SetEnvironmentVariableA("IGDEXT_FORCE_FALLBACK", "1"); TraceF("x4r: Backend = dp4a, XeSS runs its DP4a path"); }
++    if (IniValue("Capture") == "true")      // x4r.ini: record the game's kernels instead of failing (see x4r-capture in the notes)
++    { SetEnvironmentVariableA("X4R_CAPTURE", "1"); SetEnvironmentVariableA("IGDEXT_TRACE", "1"); }
 +    char forced[32] = {};
 +    GetEnvironmentVariableA("X4R_PROFILE", forced, sizeof forced);          // dxil | rdna3 | rdna4 | auto
 +    std::string want = forced[0] ? forced : IniValue("Profile");
@@ -283,7 +289,7 @@ index 0000000..7d7ab96
 +// writes C:\x4r\rs\<hash>.txt: one line per root parameter, then static samplers (parsed by the Linux-side translator)
 +void DescribeRootSignature(unsigned long long h, const void* blob, size_t size)
 +{
-+    if (!getenv("X4R_CAPTURE")) return;     // translation input for the Linux-side tools; not needed to run
++    if (!GetEnvironmentVariableA("X4R_CAPTURE", nullptr, 0)) return;     // translation input for the Linux-side tools; not needed to run
 +    char path[MAX_PATH]; snprintf(path, sizeof(path), "C:\\x4r\\rs\\%016llx.txt", h);
 +    if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) return;
 +    CreateDirectoryA("C:\\x4r", nullptr); CreateDirectoryA("C:\\x4r\\rs", nullptr);
@@ -420,7 +426,7 @@ index 0000000..7d7ab96
 +PFN_Dispatch o_Dispatch;
 +PFN_Close o_Close;
 +
-+constexpr int kRing = 8, kMaxDisp = 64;            // frames in flight x dispatches per frame
++constexpr int kRing = 8, kMaxDisp = 640;            // frames in flight x dispatches per frame
 +ID3D12QueryHeap* g_qheap = nullptr;
 +ID3D12Resource* g_qread = nullptr;
 +UINT64* g_qmap = nullptr;
@@ -464,6 +470,13 @@ index 0000000..7d7ab96
 +        total += ms;
 +    }
 +    g_frameMs += total; ++g_frames;
++    if (g_frames % 120 == 1)   // one frame in dispatch order: exposes gaps and what runs when
++        for (int d = 0; d < sl.count; ++d)
++        {
++            UINT64 a = g_qmap[(idx * kMaxDisp + d) * 2], b = g_qmap[(idx * kMaxDisp + d) * 2 + 1];
++            TraceF("x4r:   order %2d kernel %016llx %.3f ms, starts +%.3f ms", d, sl.hash[d], b >= a ? (double)(b - a) * 1000.0 / g_tsFreq : 0.0,
++                   (double)(a - g_qmap[(idx * kMaxDisp) * 2]) * 1000.0 / g_tsFreq);
++        }
 +    if (g_frames % 120 == 0)
 +    {
 +        TraceF("x4r: GPU xess time per frame (avg of last 120): %.3f ms", g_frameMs / 120);
@@ -535,16 +548,83 @@ index 0000000..7d7ab96
 +}
 +}
 +
-+// DllMain: locate the runtime folder beside this DLL (<game folder>\x4r), falling back to C:\x4r
-+extern "C" void X4rInit(HMODULE self)
++bool SameFile(const std::string& a, const std::string& b)
++{
++    FILE* fa = nullptr; FILE* fb = nullptr;
++    if (fopen_s(&fa, a.c_str(), "rb") != 0 || !fa) return false;
++    if (fopen_s(&fb, b.c_str(), "rb") != 0 || !fb) { fclose(fa); return false; }
++    bool same = true;
++    char x[65536], y[65536];
++    for (;;)
++    {
++        size_t nx = fread(x, 1, sizeof x, fa), ny = fread(y, 1, sizeof y, fb);
++        if (nx != ny || memcmp(x, y, nx)) { same = false; break; }
++        if (!nx) break;
++    }
++    fclose(fa); fclose(fb);
++    return same;
++}
++
++// Plugin mode: OptiScaler loads <game>\plugins\x4r.asi (this same DLL) at startup, before the game touches DXGI or XeSS.
++// It does what a manual install would: puts the shim where XeSS looks for igdext64.dll (the prefix's system32, a path
++// Proton fixes), and gives the Intel vendor id to the game's GPU through dxvk.conf so XeSS enables its XMX path.
++void InstallFromPlugin(const std::string& self)
++{
++    char sys[MAX_PATH] = {};
++    GetSystemDirectoryA(sys, MAX_PATH);
++    const std::string dest = std::string(sys) + "\\igdext64.dll", backup = dest + ".x4r-backup";
++    std::string note = "ok";
++    if (!SameFile(self, dest))
++    {
++        if (GetFileAttributesA(dest.c_str()) != INVALID_FILE_ATTRIBUTES && GetFileAttributesA(backup.c_str()) == INVALID_FILE_ATTRIBUTES)
++            CopyFileA(dest.c_str(), backup.c_str(), TRUE);        // Proton's own igdext64.dll
++        DeleteFileA(dest.c_str());                                 // a symlink into Proton would otherwise be written through
++        if (!CopyFileA(self.c_str(), dest.c_str(), FALSE)) note = "could not copy the shim into " + dest;
++    }
++    char exe[MAX_PATH] = {};
++    GetModuleFileNameA(nullptr, exe, MAX_PATH);
++    std::string conf = exe;
++    conf.resize(conf.find_last_of('\\') + 1);
++    conf += "dxvk.conf";
++    std::string have;
++    if (FILE* f = nullptr; fopen_s(&f, conf.c_str(), "rb") == 0 && f) { char b[4096]; size_t n; while ((n = fread(b, 1, sizeof b, f)) > 0) have.append(b, n); fclose(f); }
++    if (have.find("# x4r begin") == std::string::npos)
++    {
++        if (!have.empty() && have.back() != '\n') have += "\n";
++        have += "# x4r begin\ndxgi.customVendorId = 8086\ndxgi.customDeviceId = e20b\ndxgi.hideAmdGpu = False\n# x4r end\n";
++        FILE* f = nullptr;
++        if (fopen_s(&f, conf.c_str(), "wb") == 0 && f) { fwrite(have.data(), 1, have.size(), f); fclose(f); }
++        else note += "; could not write " + conf;
++    }
++    TraceF("x4r: plugin install: %s", note.c_str());
++    if (FILE* f = nullptr; fopen_s(&f, (g_dir + "\\installation-status.txt").c_str(), "wb") == 0 && f) { fprintf(f, "%s\n", note.c_str()); fclose(f); }
++}
++
++// DllMain: locate the runtime folder (<dll folder>\x4r, or X4R_DIR set by the plugin instance), falling back to C:\x4r.
++// Returns true when this DLL was loaded as the x4r.asi plugin (it then only installs itself and stays idle).
++extern "C" bool X4rInit(HMODULE self)
 +{
 +    char p[MAX_PATH] = {};
-+    if (!GetModuleFileNameA(self, p, MAX_PATH)) return;
++    char env[MAX_PATH] = {};
++    if (GetEnvironmentVariableA("X4R_DIR", env, MAX_PATH) && DirExists(env)) { g_dir = env; return false; }
++    if (!GetModuleFileNameA(self, p, MAX_PATH)) return false;
++    const std::string path = p;
 +    char* slash = strrchr(p, '\\');
-+    if (!slash) return;
++    if (!slash) return false;
 +    *slash = 0;
 +    std::string cand = std::string(p) + "\\x4r";
++    if (DirExists(std::string(p) + "\\dxil")) cand = p;      // release layout: <game>\x4r\x4r.asi beside its kernels
 +    if (DirExists(cand)) g_dir = cand;
++    const size_t n = path.size();
++    const bool asi = n > 4 && _stricmp(path.c_str() + n - 4, ".asi") == 0;
++    if (asi && DirExists(cand))
++    {
++        SetEnvironmentVariableA("X4R_DIR", cand.c_str());          // the copy in system32 finds the kernels through this
++        SelectOverrides();   // as early as the plugin loads: vkd3d-proton only sees VKD3D_SHADER_OVERRIDE if it is set before it initialises
++        if (IniValue("Trace") == "true") SetEnvironmentVariableA("IGDEXT_TRACE", "1");   // x4r.ini: per-kernel GPU times in C:\\igdext_trace.log (inside the prefix)
++        InstallFromPlugin(path);
++    }
++    return asi;
 +}
 +
 +// 1 on an x4r install (the ANV self-test does not apply), 0 without the x4r runtime (upstream behaviour). A game whose
@@ -573,6 +653,7 @@ index 0000000..7d7ab96
 +extern "C" void X4rKernelFailed(unsigned long long kernelHash, const char* why)
 +{
 +    ++g_failed;
++    if (FILE* f = nullptr; fopen_s(&f, (g_dir + "\\failed-kernels.txt").c_str(), "ab") == 0 && f) { fprintf(f, "%016llx %s\n", kernelHash, why); fclose(f); }
 +    TraceF("x4r: FAILED kernel %016llx: %s (XeSS library %s, runtime expects %s)", kernelHash, why, g_xessVer.c_str(), IniValue("XessVersion").c_str());
 +    WriteStatus(0);
 +}
@@ -642,6 +723,16 @@ index 0000000..7d7ab96
 +    out->pShaderBytecode = it->second.data();
 +    out->BytecodeLength = it->second.size();
 +    return true;
++}
++
++// capture mode: which root signature goes with which kernel (input of the Linux-side translation)
++extern "C" void X4rCaptureNote(unsigned long long kernelHash, unsigned long long rsHash)
++{
++    static std::mutex m; static std::map<unsigned long long, bool> seen;
++    std::lock_guard<std::mutex> l(m);
++    if (seen[kernelHash]) return;
++    seen[kernelHash] = true;
++    if (FILE* f = nullptr; fopen_s(&f, (g_dir + "\\captured-kernels.txt").c_str(), "ab") == 0 && f) { fprintf(f, "%016llx %016llx\n", kernelHash, rsHash); fclose(f); }
 +}
 +
 +extern "C" void X4rNotePipeline(ID3D12PipelineState* pso, unsigned long long kernelHash)

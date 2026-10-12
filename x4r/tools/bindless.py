@@ -28,6 +28,14 @@ for l in open(src):
     if m:
         out.append("#define CBD%s X4R_CBV[x4rpc.w[%d]].d" % (m.group(1), par[('CBV', int(m.group(2)))]))
         continue
+    if re.match(r'SamplerState smp0 : register\(s0\);', l):
+        # vkd3d-proton keeps static samplers in descriptor set 3, binding 0 (checked in the SPIR-V it generates for the same
+        # kernel); dxc's default set 0 binds the wrong descriptor, which only shows once a sample lands between texels
+        out.append("[[vk::binding(0, 3)]] SamplerState smp0;")
+        continue
+    if l.startswith('void main('):
+        # as vkd3d's SPIR-V: preserve fp16 denormals
+        out.append('[[vk::ext_capability(4464)]] [[vk::ext_extension("SPV_KHR_float_controls")]] [[vk::ext_execution_mode(4459, 16)]]')
     body.append(l.rstrip("\n"))
 # declarations must precede first use: place after the helper prelude's first line
 open(dst, "w").write("\n".join(out + body) + "\n")

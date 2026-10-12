@@ -4,7 +4,7 @@
 # Reads x4r/status.txt, which the shim rewrites while XeSS runs, and says whether the translated Intel XMX kernels executed.
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 S=$HERE/status.txt
-[[ -f $S ]] || { echo 'FAIL: no x4r/status.txt - the x4r shim was never loaded. Run install.sh, then start the game and enable XeSS (DX12).'; exit 1; }
+[[ -f $S ]] || { echo 'FAIL: no x4r/status.txt - the x4r shim was never loaded. Start the game and enable XeSS (DX12).'; exit 1; }
 get() { sed -n "s/^$1=//p" "$S"; }
 age=$(( $(date +%s) - $(stat -c %Y "$S") ))
 echo "XeSS library : $(get xess_library)"

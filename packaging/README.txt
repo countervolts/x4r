@@ -8,13 +8,13 @@ on RDNA's WMMA units. No Intel hardware is involved.
 Install
 -------
 1. Extract everything in this zip into the folder that holds the game's main .exe (Unreal Engine:
-   <game>/<Project>/Binaries/Win64). You get dxgi.dll, OptiScaler.ini, libxess.dll, Licenses/ and a plugins folder.
+   <game>/<Project>/Binaries/Win64). You get dxgi.dll, OptiScaler.ini, libxess.dll, Licenses/ and an x4r folder.
    If the folder already has a dxgi.dll or OptiScaler.ini (another OptiScaler install), move those out of the way
    first, and remove PROTON_USE_OPTISCALER from the game's launch options.
 2. Use GE-Proton 11 for the game. No launch options are needed.
 3. Start the game and choose FSR 3.1 (or DLSS) in its graphics settings. OptiScaler replaces it with XeSS.
    (Press Insert in the game for OptiScaler's menu.)
-4. Optional check, from a terminal in the game folder after playing a few seconds:   bash plugins/x4r/x4r-check.sh
+4. Optional check, from a terminal in the game folder after playing a few seconds:   bash x4r/x4r-check.sh
    It prints PASS only if the translated XMX kernels were dispatched, and how many run on WMMA.
 
 The first launch sets x4r up by itself: the x4r plugin copies its shim into the game's Proton prefix (Proton fixes the
@@ -23,7 +23,7 @@ game folder that makes the GPU report an Intel vendor id (XeSS only enables its 
 touched and no sudo is needed. Proton overwrites the shim when it updates a prefix; the next game launch puts it back.
 
 Supported: Radeon RX 7000 and RX 9000 (RDNA3 gfx1100-1103, gfx1150/1151; RDNA4 gfx1200/1201) with Mesa RADV. Other AMD
-GPUs get the stock dot4 kernels. plugins/x4r/x4r.ini can force a kernel set (Profile = auto | rdna3 | rdna4 | dxil).
+GPUs get the stock dot4 kernels. x4r/x4r.ini can force a kernel set (Profile = auto | rdna3 | rdna4 | dxil).
 
 Limits
 ------
@@ -32,12 +32,12 @@ Limits
 * Tested: Radeon RX 7700 XT (gfx1101) with a synthetic fixture. The RDNA4 kernel set, other GPUs and real games are
   untested, as is motion/disocclusion quality. Frame generation is not translated.
 * Research prototype, not affiliated with Intel, AMD or the OptiScaler project. Set IGDEXT_TRACE=1 in the launch options
-  to get C:\igdext_trace.log inside the prefix; plugins/x4r/installation-status.txt reports the first-launch setup.
+  to get C:\igdext_trace.log inside the prefix; x4r/installation-status.txt reports the first-launch setup.
 
-Uninstall: bash plugins/x4r/uninstall.sh, then delete dxgi.dll, OptiScaler.ini, libxess.dll, plugins and Licenses from
+Uninstall: bash x4r/uninstall.sh, then delete dxgi.dll, OptiScaler.ini, libxess.dll, x4r and Licenses from
 the game folder.
 
 Licences: x4r is GPL-3.0-only. OptiScaler (dxgi.dll) is GPL-3.0; libxess.dll is Intel's XeSS SDK under the Intel Simplified
 Software License (Licenses/XeSS_LICENSE.txt), redistributed unmodified. The shim derives from xess-xmx-linux and
-dxvk-igdext (MIT, plugins/x4r/licenses). The translated kernels derive from XeSS and are not covered by x4r's licence.
-Source: plugins/x4r/source and https://github.com/countervolts/x4r
+dxvk-igdext (MIT, x4r/licenses). The translated kernels derive from XeSS and are not covered by x4r's licence.
+Source: x4r/source and https://github.com/countervolts/x4r

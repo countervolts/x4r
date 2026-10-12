@@ -423,7 +423,8 @@ struct Tx
     {
         // args: pred, subop, l1, l3, scale, imm, dsize, vsize, order, chmask, offsets, [data,] surface
         int order = cint(C.getArgOperand(8));
-        if (order != 2) die("non-transposed LSC access");
+        bool singleDword = order == 1 && cint(C.getArgOperand(7)) == 1 && cint(C.getArgOperand(6)) == 3;   // one dword: same as a transposed block
+        if (order != 2 && !singleDword) die("non-transposed LSC access");
         unsigned dsz = cint(C.getArgOperand(6));
         (void)dsz;
         int64_t imm = cint(C.getArgOperand(5)), scale = cint(C.getArgOperand(4));

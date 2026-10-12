@@ -10,20 +10,21 @@ x4r_fast_profile() {
   unset X4R_WMMA_SCATTERA X4R_WMMA_ASTRIDE X4R_WMMA_BSTRIDE X4R_REG_ROUTE
   export X4R_SIMPLE_SHUFFLES=1 X4R_BITCAST_FWD=1 X4R_FWD=3 X4R_WMMA_CACHE=6
   case "$kernel" in
-    2)
+    2|32|34|38|40|42|43)   # the history-reprojection / first-layer kernel family (10 texture samples, 3 dpas) of each XeSS setup
       export X4R_WORD_GATHER=1 X4R_EFORM_MIN=5 X4R_FWD_DEPTH=128
       [[ $target != spirv ]] || export X4R_NATIVE_MIXED_DOT=1
       ;;
-    29)
+    29|33|35|39|41)   # dyn_33/35/39/41 are the same network kernel built for the other XeSS setups (OptiScaler, Ghost of Tsushima)
       export X4R_WMMA_SCATTERA=1 X4R_WMMA_SINGLE=1 X4R_WMMA_CACHE=9
       [[ $rdna != 3 ]] || export X4R_WMMA_REGC=1      # row=2*component+tt, col=lane is the gfx11 wave32 layout only
       ;;
     7) export X4R_WMMA_SCATTERA=1 ;;
     26) export X4R_WMMA_SCATTERA=1 X4R_PACK_EARLY=1 X4R_WMMA_CACHE=9 ;;
+    # dyn_24 (two waves sharing SLM) has no WMMA profile: a WMMA build disagrees with the CPU oracle at its first dpas
     12|13|18|23|25|27|28) export X4R_PACK_EARLY=1 ;;
     *) echo "No validated fast profile for dyn_$kernel" >&2; return 2 ;;
   esac
   case "$kernel" in
-    7|26|29) export X4R_WMMA_ASTRIDE=12 X4R_WMMA_BSTRIDE=12 ;;
+    7|26|29|33|35|39|41) export X4R_WMMA_ASTRIDE=12 X4R_WMMA_BSTRIDE=12 ;;
   esac
 }

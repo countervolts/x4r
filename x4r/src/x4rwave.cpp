@@ -1080,7 +1080,9 @@ struct Tx
 
     void lscLoadStore(CallInst& C, bool isStore, bool slm)
     {
-        if (cint(C.getArgOperand(8)) != 2) die("non-transposed LSC access");
+        // order 1 (non-transposed) with one 32-bit element is the same access as a one-dword transposed block
+        bool singleDword = cint(C.getArgOperand(8)) == 1 && cint(C.getArgOperand(7)) == 1 && cint(C.getArgOperand(6)) == 3;
+        if (cint(C.getArgOperand(8)) != 2 && !singleDword) die("non-transposed LSC access");
         int64_t imm = cint(C.getArgOperand(5)), scale = cint(C.getArgOperand(4));
         string addr = "((" + scalarExpr(C.getArgOperand(10)) + ")*" + to_string(scale) + "u + " + to_string(imm) + "u)";
         Value* data = isStore ? C.getArgOperand(11) : nullptr;
@@ -1088,6 +1090,15 @@ struct Tx
         unsigned W = layOf(dt).W;
         int surf = slm ? -1 : surfaceOf(C.getArgOperand(isStore ? 12 : 11));
         if (isStore) blockStore(surf, slm, addr, data, W);
+        else if (layOf(dt).U)
+        {
+            // a scalar result (<1 x T> returned as T) is one uniform dword
+            string rd;
+            if (slm) rd = "slm[(" + addr + ")>>2]";
+            else if (res[surf].kind == "CBV") rd = "CBD" + to_string(surf) + "[((" + addr + ")>>2)>>2][((" + addr + ")>>2)&3u]";
+            else rd = "R" + to_string(surf) + ".Load(" + addr + ")";
+            emit(nm(&C) + " = " + rd + ";");
+        }
         else blockLoad(surf, slm, addr, nm(&C), W);
     }
 
@@ -1948,128 +1959,231 @@ struct Tx
             auto& g = stores[i];
             string d = newTmp(1);
             emit(slot(d,0) + " = " + addresses[i] + ";");
-            string store = "ldsA[wvA + (2u*(" + slot(d,0) + ">>3u)+tt)*" + to_string(wmmaAStride()) + "u + (" + slot(d,0) + "&7u)] = " + slot(g.source,g.slot) + ";";
+            string store = "ldsA[wvA" + curAOff + " + (2u*(" + slot(d,0) + ">>3u)+tt)*" + to_string(wmmaAStride()) + "u + (" + slot(d,0) + "&7u)] = " + slot(g.source,g.slot) + ";";
             if (g.members != 65535u) store = "if ((" + hex32(g.members) + " >> lane) & 1u) { " + store + " }";
             emit(store);
         }
         if (getenv("X4R_COST")) fprintf(stderr,"WMMA_SCATTERA %u words, %zu stores\n",words,stores.size());
         return true;
     }
+    // ---- batched WMMA emission ----
+    // A batch is up to X4R_WMMA_BATCH independent dpas calls of one basic block (no member consumes another's result, nothing between
+    // them consumes a member's result before the last one). They are deferred to the last member's position and emitted together: every
+    // operand tile is staged into its own LDS region, one barrier, all loads, then all multiplies (independent accumulators in flight
+    // per wave: a lone dependent pair of WMMAs leaves the matrix unit mostly idle), then all extractions.
+    struct WPending { CallInst* C; Value* acc; Value* B; Value* A; unsigned precB, precA, rep; };
+    std::vector<WPending> pendingW;
+    std::map<CallInst*, std::pair<int, unsigned>> wgroupOf;    // call -> (group id, group size)
+    string curAOff, curBOff;                                    // LDS region offsets while staging (empty: region 0)
+    unsigned wmmaBatchSize() { static int n = -1; if (n < 0) { const char* o = getenv("X4R_WMMA_BATCH"); n = o ? atoi(o) : 1; if (n < 1) n = 1; if (n > 8) n = 8; } return (unsigned)n; }
+    bool dpasArgs(CallInst& C, Value*& acc, Value*& B, Value*& A, unsigned& precB, unsigned& precA, unsigned& rep)
+    {
+        Function* f = C.getCalledFunction(); if (!f) return false;
+        string n = f->getName().str();
+        if (n.rfind("llvm.genx.dpas2", 0) == 0) { acc = C.getArgOperand(0); B = C.getArgOperand(1); A = C.getArgOperand(2); precB = cint(C.getArgOperand(3)); precA = cint(C.getArgOperand(4)); rep = cint(C.getArgOperand(6)); return true; }
+        if (n.rfind("llvm.genx.dpas.nosrc0", 0) == 0) { uint32_t info = (uint32_t)cint(C.getArgOperand(2)); acc = nullptr; B = C.getArgOperand(0); A = C.getArgOperand(1); precB = info & 0xff; precA = (info >> 8) & 0xff; rep = (info >> 24) & 0xff; return true; }
+        return false;
+    }
+    void buildWmmaGroups()
+    {
+        wgroupOf.clear();
+        unsigned maxN = wmmaBatchSize();
+        if (maxN < 2 || trace || !getenv("X4R_WMMA")) return;
+        int gid = 0;
+        for (auto& BB : *F)
+        {
+            std::vector<CallInst*> cur; std::set<Value*> taint;
+            auto flush = [&]() {
+                if (cur.size() >= 2) { for (auto* m : cur) wgroupOf[m] = {gid, (unsigned)cur.size()}; ++gid; }
+                cur.clear(); taint.clear();
+            };
+            for (auto& I : BB)
+            {
+                if (isa<PHINode>(I)) continue;
+                if (I.isTerminator()) break;
+                auto* C = dyn_cast<CallInst>(&I);
+                Value *acc = nullptr, *B = nullptr, *A = nullptr; unsigned pb = 0, pa = 0, rep = 0;
+                bool member = C && dpasArgs(*C, acc, B, A, pb, pa, rep) && wmmaEligible(*C, B, rep);
+                bool usesTaint = false;
+                for (auto& op : I.operands()) if (taint.count(op.get())) usesTaint = true;
+                if (member)
+                {
+                    if (usesTaint || cur.size() >= maxN) { flush(); }
+                    cur.push_back(C); taint.insert(C);
+                    continue;
+                }
+                if (usesTaint) { flush(); continue; }
+            }
+            flush();
+        }
+    }
     void dpasWmma(CallInst& C, Value* acc, Value* B, Value* A, unsigned precB, unsigned precA, unsigned rep)
+    {
+        auto g = wgroupOf.find(&C);
+        if (g == wgroupOf.end()) { std::vector<WPending> one{{&C, acc, B, A, precB, precA, rep}}; dpasWmmaGroup(one); return; }
+        pendingW.push_back({&C, acc, B, A, precB, precA, rep});
+        if (pendingW.size() == g->second.second) { std::vector<WPending> batch; batch.swap(pendingW); dpasWmmaGroup(batch); }
+    }
+    void dpasWmmaGroup(std::vector<WPending>& ms)
     {
         wmmaUsed = true;
         auto isSigned = [&](unsigned p) { if (p == 8) return true; if (p == 7) return false; die("dpas: unsupported precision " + to_string(p)); };
-        bool sB = isSigned(precB), sA = isSigned(precA);
-        string d = nm(&C);
-        unsigned mask = (sA ? 1u : 0u) | (sB ? 2u : 0u) | 4u | 8u;
-        unsigned aSlots = (rep * 8 + 15) / 16;
-        auto it = wchainOf.find(&C);
-        int chain = it == wchainOf.end() ? -1 : it->second.first, pos = it == wchainOf.end() ? 0 : it->second.second;
-        bool last = chain < 0 || pos + 1 == (int)wchains[chain].m.size();
-        bool materialize = last || trace;                        // intermediate chain results are only ever consumed by the next dpas
-        string cv = chain < 0 ? "ws" + to_string(ntmp++) : "wc" + to_string(chain);
-        if (chain < 0 || pos == 0) { decls << "  X4RMatC " << cv << ";\n"; }
+        const unsigned R = wmmaBatchSize();
+        const unsigned regionA = 16 * wmmaAStride(), regionB = 16 * wmmaBStride();
+        struct Mem { WPending w; string d, cv; unsigned mask, aSlots; bool materialize; string nA, nB; bool hitA, hitB; };
+        std::vector<Mem> mm;
         emit("{");
-        if (chain < 0 || pos == 0)
+        // 1. accumulators
+        unsigned cReg = 0;
+        for (auto& w : ms)
         {
-            if (getenv("X4R_WMMA_REGC")) {
-                // RADV gfx11 wave32 accumulator: row=2*component+tt, col=lane.
-                // This is exactly the CM output layout; keep C in registers.
-                emit("  " + cv + " = cmSplatC(0);");
-                if (acc) for (unsigned r = 0; r < rep; ++r)
-                    emit("  " + cv + " = cmInsertC(asint(" + dataSlot(acc, r) + "), " + cv + ", " + to_string(r) + "u);");
-            } else {
-                for (unsigned r = 0; r < rep; ++r) emit("  ldsC[wvC + " + to_string(2 * r) + "u*16u + tt*16u + lane] = " + (acc ? dataSlot(acc, r) : string("0u")) + ";");
-                emit("  GroupMemoryBarrier();");
-                emit("  " + cv + " = cmLoadC(ldsC[wvC], 0u, 16u);");
-            }
-        }
-        else if (trace)
-        {
-            // keep the resident accumulator and nothing else
-        }
-        // operand reuse: the same tile often feeds a few consecutive dpas (2x2 blocks of activation x weight tiles); stage and load each once
-        int saved = fwdOverride; fwdOverride = 3;
-        string sigA = operandSig(A), sigB = operandSig(B);
-        fwdOverride = saved;
-        BasicBlock* BBc = C.getParent();
-        auto lookup = [&](std::map<string, OpTile>& cache, const string& sig, const char* kind) -> std::pair<OpTile*, bool>
-        {
-            auto it = cache.find(sig);
-            const char* option = getenv("X4R_WMMA_CACHE");
-            int distance = option ? atoi(option) : 6;
-            bool hit = distance > 0 && it != cache.end() && it->second.bb == BBc && dseq - it->second.last <= distance;
-            if (it == cache.end())
+            CallInst& C = *w.C;
+            Mem m; m.w = w;
+            bool sB = isSigned(w.precB), sA = isSigned(w.precA);
+            m.d = nm(&C);
+            m.mask = (sA ? 1u : 0u) | (sB ? 2u : 0u) | 4u | 8u;
+            m.aSlots = (w.rep * 8 + 15) / 16;
+            auto it = wchainOf.find(&C);
+            int chain = it == wchainOf.end() ? -1 : it->second.first, pos = it == wchainOf.end() ? 0 : it->second.second;
+            bool last = chain < 0 || pos + 1 == (int)wchains[chain].m.size();
+            m.materialize = last || trace;                       // intermediate chain results are only ever consumed by the next dpas
+            m.cv = chain < 0 ? "ws" + to_string(ntmp++) : "wc" + to_string(chain);
+            if (chain < 0 || pos == 0) { decls << "  X4RMatC " << m.cv << ";\n"; }
+            if (chain < 0 || pos == 0)
             {
-                OpTile t; t.id = (int)cache.size(); t.bb = BBc; t.last = dseq;
-                it = cache.emplace(sig, t).first;
-                decls << "  X4RMat" << kind << " w" << kind << (kind[0] == 'A' ? "a" : "b") << it->second.id << "_0, w" << kind << (kind[0] == 'A' ? "a" : "b") << it->second.id << "_1;\n";
+                if (getenv("X4R_WMMA_REGC")) {
+                    // RADV gfx11 wave32 accumulator: row=2*component+tt, col=lane.
+                    // This is exactly the CM output layout; keep C in registers.
+                    emit("  " + m.cv + " = cmSplatC(0);");
+                    if (w.acc) for (unsigned r = 0; r < w.rep; ++r)
+                        emit("  " + m.cv + " = cmInsertC(asint(" + dataSlot(w.acc, r) + "), " + m.cv + ", " + to_string(r) + "u);");
+                } else {
+                    string off = ms.size() > 1 ? " + " + to_string(cReg * 256) + "u" : "";
+                    for (unsigned r = 0; r < w.rep; ++r) emit("  ldsC[wvC" + off + " + " + to_string(2 * r) + "u*16u + tt*16u + lane] = " + (w.acc ? dataSlot(w.acc, r) : string("0u")) + ";");
+                    emit("  GroupMemoryBarrier();");
+                    emit("  " + m.cv + " = cmLoadC(ldsC[wvC" + off + "], 0u, 16u);");
+                    ++cReg;
+                }
             }
-            it->second.bb = BBc; if (!hit) it->second.last = dseq; else it->second.last = dseq;
-            return {&it->second, hit};
-        };
-        auto la = lookup(aTiles, sigA, "A"), lb = lookup(bTiles, sigB, "B");
-        string nA = "wAa" + to_string(la.first->id), nB = "wBb" + to_string(lb.first->id);
-        ++dseq;
-        if (!la.second) {
-            if (getenv("X4R_WMMA_REGA")) {
-                // Transpose the 4 VGPR slot bits with the low 2 lane bits.
-                // Then a single wave shuffle per packed word selects the
-                // interleaved row and duplicates it across the wave halves.
-                string raw = newTmp(4), first = newTmp(4), second = newTmp(4);
-                for (unsigned s = 0; s < 4; ++s)
-                    emit("  " + slot(raw,s) + " = " + (s < aSlots ? dataSlot(A,s) : string("0u")) + ";");
-                for (unsigned s = 0; s < 4; ++s) {
-                    string shuffled = newTmp(1);
-                    emit("  " + slot(shuffled,0) + " = WaveReadLaneAt(" + slot(raw,s^1u) + ", WaveGetLaneIndex() ^ 1u);");
-                    emit("  " + slot(first,s) + " = ((lane & 1u) == " + to_string(s&1u) + "u) ? " + slot(raw,s) + " : " + slot(shuffled,0) + ";");
+            mm.push_back(m);
+        }
+        // 2. stage the operand tiles of every member (operand reuse: the same tile often feeds a few consecutive dpas, stage and load each once)
+        unsigned regA = 0, regB = 0;
+        std::vector<std::pair<string, unsigned>> loadsA, loadsB;      // (tile name, region) to load after the barrier
+        for (auto& m : mm)
+        {
+            CallInst& C = *m.w.C; Value *A = m.w.A, *B = m.w.B;
+            int saved = fwdOverride; fwdOverride = 3;
+            string sigA = operandSig(A), sigB = operandSig(B);
+            fwdOverride = saved;
+            BasicBlock* BBc = C.getParent();
+            auto lookup = [&](std::map<string, OpTile>& cache, const string& sig, const char* kind) -> std::pair<OpTile*, bool>
+            {
+                auto it = cache.find(sig);
+                const char* option = getenv("X4R_WMMA_CACHE");
+                int distance = option ? atoi(option) : 6;
+                bool hit = distance > 0 && it != cache.end() && it->second.bb == BBc && dseq - it->second.last <= distance;
+                if (it == cache.end())
+                {
+                    OpTile t; t.id = (int)cache.size(); t.bb = BBc; t.last = dseq;
+                    it = cache.emplace(sig, t).first;
+                    decls << "  X4RMat" << kind << " w" << kind << (kind[0] == 'A' ? "a" : "b") << it->second.id << "_0, w" << kind << (kind[0] == 'A' ? "a" : "b") << it->second.id << "_1;\n";
                 }
-                for (unsigned s = 0; s < 4; ++s) {
-                    string shuffled = newTmp(1);
-                    emit("  " + slot(shuffled,0) + " = WaveReadLaneAt(" + slot(first,s^2u) + ", WaveGetLaneIndex() ^ 2u);");
-                    emit("  " + slot(second,s) + " = ((lane & 2u) == " + to_string(s&2u) + "u) ? " + slot(first,s) + " : " + slot(shuffled,0) + ";");
+                it->second.bb = BBc; if (!hit) it->second.last = dseq; else it->second.last = dseq;
+                return {&it->second, hit};
+            };
+            auto la = lookup(aTiles, sigA, "A"), lb = lookup(bTiles, sigB, "B");
+            m.nA = "wAa" + to_string(la.first->id); m.nB = "wBb" + to_string(lb.first->id);
+            m.hitA = la.second; m.hitB = lb.second;
+            ++dseq;
+            if (!m.hitA) {
+                curAOff = R > 1 && regA ? " + " + to_string(regA * regionA) + "u" : "";
+                if (getenv("X4R_WMMA_REGA")) {
+                    // Transpose the 4 VGPR slot bits with the low 2 lane bits.
+                    // Then a single wave shuffle per packed word selects the
+                    // interleaved row and duplicates it across the wave halves.
+                    string raw = newTmp(4), first = newTmp(4), second = newTmp(4);
+                    for (unsigned s = 0; s < 4; ++s)
+                        emit("  " + slot(raw,s) + " = " + (s < m.aSlots ? dataSlot(A,s) : string("0u")) + ";");
+                    for (unsigned s = 0; s < 4; ++s) {
+                        string shuffled = newTmp(1);
+                        emit("  " + slot(shuffled,0) + " = WaveReadLaneAt(" + slot(raw,s^1u) + ", WaveGetLaneIndex() ^ 1u);");
+                        emit("  " + slot(first,s) + " = ((lane & 1u) == " + to_string(s&1u) + "u) ? " + slot(raw,s) + " : " + slot(shuffled,0) + ";");
+                    }
+                    for (unsigned s = 0; s < 4; ++s) {
+                        string shuffled = newTmp(1);
+                        emit("  " + slot(shuffled,0) + " = WaveReadLaneAt(" + slot(first,s^2u) + ", WaveGetLaneIndex() ^ 2u);");
+                        emit("  " + slot(second,s) + " = ((lane & 2u) == " + to_string(s&2u) + "u) ? " + slot(first,s) + " : " + slot(shuffled,0) + ";");
+                    }
+                    for (unsigned half = 0; half < 2; ++half) {
+                        string matrix = m.nA + "_" + to_string(half), packed = newTmp(4);
+                        emit("  " + matrix + " = cmSplatA(cmByte(0u));");
+                        for (unsigned q = 0; q < 4; ++q)
+                            emit("  " + slot(packed,q) + " = WaveReadLaneAt(" + slot(second,q) + ", (lane >> 2u) | ((lane & 2u) << 2u) | ((lane & 1u) << 4u) | " + to_string(half*4) + "u);");
+                        for (unsigned e = 0; e < 16; ++e)
+                            emit("  " + matrix + " = cmInsertA(cmByte(" + slot(packed,e/4) + " >> " + to_string((e%4)*8) + "u), " + matrix + ", " + to_string(e) + "u);");
+                    }
+                } else {
+                    if (!stageWmmaA(A, m.aSlots*16)) {
+                        for (unsigned s = 0; s < m.aSlots; ++s)
+                            emit("  ldsA[wvA" + curAOff + " + (2u*((" + to_string(16 * s) + "u+lane)>>3)+tt)*" + to_string(wmmaAStride()) + "u + ((" + to_string(16 * s) + "u+lane)&7u)] = " + dataSlot(A, s) + ";");
+                    }
+                    loadsA.push_back({m.nA, regA});
+                    ++regA;
                 }
-                for (unsigned half = 0; half < 2; ++half) {
-                    string matrix = nA + "_" + to_string(half), packed = newTmp(4);
-                    emit("  " + matrix + " = cmSplatA(cmByte(0u));");
-                    for (unsigned q = 0; q < 4; ++q)
-                        emit("  " + slot(packed,q) + " = WaveReadLaneAt(" + slot(second,q) + ", (lane >> 2u) | ((lane & 2u) << 2u) | ((lane & 1u) << 4u) | " + to_string(half*4) + "u);");
-                    for (unsigned e = 0; e < 16; ++e)
-                        emit("  " + matrix + " = cmInsertA(cmByte(" + slot(packed,e/4) + " >> " + to_string((e%4)*8) + "u), " + matrix + ", " + to_string(e) + "u);");
+            }
+            if (!m.hitB)
+            {
+                curBOff = R > 1 && regB ? " + " + to_string(regB * regionB) + "u" : "";
+                if (getenv("X4R_WMMA_REGB")) {
+                    // gfx11 B fragments contain a column's 16 bytes per lane;
+                    // the identical CM weights already live in both wave halves.
+                    for (unsigned half = 0; half < 2; ++half) {
+                        string matrix = m.nB + "_" + to_string(half);
+                        emit("  " + matrix + " = cmSplatB(cmByte(0u));");
+                        for (unsigned e = 0; e < 16; ++e)
+                            emit("  " + matrix + " = cmInsertB(cmByte(" + dataSlot(B, half * 4 + e / 4) + " >> " + to_string((e % 4) * 8) + "u), " + matrix + ", " + to_string(e) + "u);");
+                    }
                 }
-            } else if (!stageWmmaA(A, aSlots*16)) {
-                for (unsigned s = 0; s < aSlots; ++s)
-                    emit("  ldsA[wvA + (2u*((" + to_string(16 * s) + "u+lane)>>3)+tt)*" + to_string(wmmaAStride()) + "u + ((" + to_string(16 * s) + "u+lane)&7u)] = " + dataSlot(A, s) + ";");
+                else {
+                    if (getenv("X4R_WMMA_FULLB")) { for (unsigned k = 0; k < 8; ++k) emit("  ldsB[wvB" + curBOff + " + lane*" + to_string(wmmaBStride()) + "u + " + to_string(k) + "u] = " + dataSlot(B, k) + ";"); }
+                    else for (unsigned q = 0; q < 4; ++q) emit("  ldsB[wvB" + curBOff + " + lane*" + to_string(wmmaBStride()) + "u + tt*4u + " + to_string(q) + "u] = (tt != 0u) ? " + dataSlot(B, 4 + q) + " : " + dataSlot(B, q) + ";");
+                    loadsB.push_back({m.nB, regB});
+                    ++regB;
+                }
             }
         }
-        if (!lb.second)
+        curAOff.clear(); curBOff.clear();
+        // 3. one barrier, then every load
+        if (!loadsA.empty() || !loadsB.empty()) emit("  GroupMemoryBarrier();");
+        for (auto& t : loadsA)
         {
-            if (getenv("X4R_WMMA_REGB")) {
-                // gfx11 B fragments contain a column's 16 bytes per lane;
-                // the identical CM weights already live in both wave halves.
-                for (unsigned half = 0; half < 2; ++half) {
-                    string matrix = nB + "_" + to_string(half);
-                    emit("  " + matrix + " = cmSplatB(cmByte(0u));");
-                    for (unsigned e = 0; e < 16; ++e)
-                        emit("  " + matrix + " = cmInsertB(cmByte(" + dataSlot(B, half * 4 + e / 4) + " >> " + to_string((e % 4) * 8) + "u), " + matrix + ", " + to_string(e) + "u);");
-                }
-            }
-            else if (getenv("X4R_WMMA_FULLB")) { for (unsigned k = 0; k < 8; ++k) emit("  ldsB[wvB + lane*" + to_string(wmmaBStride()) + "u + " + to_string(k) + "u] = " + dataSlot(B, k) + ";"); }
-            else for (unsigned q = 0; q < 4; ++q) emit("  ldsB[wvB + lane*" + to_string(wmmaBStride()) + "u + tt*4u + " + to_string(q) + "u] = (tt != 0u) ? " + dataSlot(B, 4 + q) + " : " + dataSlot(B, q) + ";");
+            string off = R > 1 && t.second ? " + " + to_string(t.second * regionA) + "u" : "";
+            emit("  " + t.first + "_0 = cmLoadA(ldsA[wvA" + off + "], 0u, " + to_string(wmmaAStride()) + "u); " + t.first + "_1 = cmLoadA(ldsA[wvA" + off + " + 4u], 0u, " + to_string(wmmaAStride()) + "u);");
         }
-        if ((!la.second && !getenv("X4R_WMMA_REGA")) || (!lb.second && !getenv("X4R_WMMA_REGB"))) emit("  GroupMemoryBarrier();");
-        if (!la.second && !getenv("X4R_WMMA_REGA")) emit("  " + nA + "_0 = cmLoadA(ldsA[wvA], 0u, " + to_string(wmmaAStride()) + "u); " + nA + "_1 = cmLoadA(ldsA[wvA + 4u], 0u, " + to_string(wmmaAStride()) + "u);");
-        if (!lb.second && !getenv("X4R_WMMA_REGB")) emit("  " + nB + "_0 = cmLoadB(ldsB[wvB], 1u, " + to_string(wmmaBStride()) + "u); " + nB + "_1 = cmLoadB(ldsB[wvB + 4u], 1u, " + to_string(wmmaBStride()) + "u);");
-        emit("  " + cv + " = cmMulAdd(" + nA + "_0, " + nB + "_0, " + cv + ", " + to_string(mask) + "); " + cv + " = cmMulAdd(" + nA + "_1, " + nB + "_1, " + cv + ", " + to_string(mask) + ");");
-        if (materialize)
+        for (auto& t : loadsB)
         {
+            string off = R > 1 && t.second ? " + " + to_string(t.second * regionB) + "u" : "";
+            emit("  " + t.first + "_0 = cmLoadB(ldsB[wvB" + off + "], 1u, " + to_string(wmmaBStride()) + "u); " + t.first + "_1 = cmLoadB(ldsB[wvB" + off + " + 4u], 1u, " + to_string(wmmaBStride()) + "u);");
+        }
+        // 4. the multiplies
+        for (auto& m : mm)
+            if (!getenv("X4R_WMMA_SKIPMUL"))   // profiling aid: keep all the data movement, drop the matrix instruction (output is wrong)
+                emit("  " + m.cv + " = cmMulAdd(" + m.nA + "_0, " + m.nB + "_0, " + m.cv + ", " + to_string(m.mask) + "); " + m.cv + " = cmMulAdd(" + m.nA + "_1, " + m.nB + "_1, " + m.cv + ", " + to_string(m.mask) + ");");
+        // 5. results
+        unsigned cOut = 0;
+        for (auto& m : mm)
+        {
+            if (!m.materialize) continue;
             if (getenv("X4R_WMMA_REGC")) {
-                for (unsigned r = 0; r < rep; ++r)
-                    emit("  " + slot(d, r) + " = asuint(cmExtractC(" + cv + ", " + to_string(r) + "u));");
+                for (unsigned r = 0; r < m.w.rep; ++r)
+                    emit("  " + slot(m.d, r) + " = asuint(cmExtractC(" + m.cv + ", " + to_string(r) + "u));");
             } else {
-                emit("  cmStoreC(ldsC[wvC], " + cv + ", 0u, 16u);");
+                string off = mm.size() > 1 ? " + " + to_string(cOut * 256) + "u" : "";
+                emit("  cmStoreC(ldsC[wvC" + off + "], " + m.cv + ", 0u, 16u);");
                 emit("  GroupMemoryBarrier();");
-                for (unsigned r = 0; r < rep; ++r) emit("  " + slot(d, r) + " = ldsC[wvC + " + to_string(2 * r) + "u*16u + tt*16u + lane];");
+                for (unsigned r = 0; r < m.w.rep; ++r) emit("  " + slot(m.d, r) + " = ldsC[wvC" + off + " + " + to_string(2 * r) + "u*16u + tt*16u + lane];");
+                ++cOut;
             }
         }
         emit("}");
@@ -2246,7 +2360,7 @@ struct Tx
         computeEForms();
         buildExpTiles();
         prepareWmma();
-        if (getenv("X4R_WMMA")) buildChains();
+        if (getenv("X4R_WMMA")) { buildChains(); buildWmmaGroups(); }
         if (getenv("X4R_DPASSTATS")) { dpasStats(); divergenceStats(); }
         if (getenv("X4R_DPASCHAINS")) dpasChains();
         if (trace)
@@ -2345,7 +2459,7 @@ struct Tx
                 out << cap << "[[vk::ext_instruction(80)]] X4RMatA cmSplatA(X4RI8 value);\n";
                 out << cap << "[[vk::ext_instruction(82)]] X4RMatA cmInsertA(X4RI8 value, X4RMatA m, [[vk::ext_literal]] uint index);\n";
             }
-            out << "groupshared uint ldsA[" << 16 * wmmaAStride() * wmmaWaves << "];\ngroupshared uint ldsB[" << 16 * wmmaBStride() * wmmaWaves << "];\ngroupshared uint ldsC[" << 256 * wmmaWaves << "];\n";
+            out << "groupshared uint ldsA[" << 16 * wmmaAStride() * wmmaWaves * wmmaBatchSize() << "];\ngroupshared uint ldsB[" << 16 * wmmaBStride() * wmmaWaves * wmmaBatchSize() << "];\ngroupshared uint ldsC[" << 256 * wmmaWaves * wmmaBatchSize() << "];\n";
         }
         if (usesSampler) out << "SamplerState smp0 : register(s0);\n";
         if (trace) out << "RWByteAddressBuffer DBG : register(u31);\n";
@@ -2357,7 +2471,7 @@ struct Tx
         out << "void main(uint3 gidIn : SV_GroupID, uint gidx : SV_GroupIndex) {\n";
         if (split) out << "  uint3 gid = uint3(gidIn.xy, gidIn.z / " << LZ << "u);\n  uint lane = gidx & 15u;\n  uint cmt = (gidx >> 4) + 2u * (gidIn.z % " << LZ << "u);\n  uint gtid = cmt;\n";
         else out << "  uint3 gid = gidIn;\n  uint lane = gidx & 15u;\n  uint cmt = gidx >> 4;\n  uint gtid = cmt;\n";
-        if (wmmaUsed) out << "  uint tt = cmt & 1u;\n  uint wvA = (gidx >> 5) * " << 16 * wmmaAStride() << "u;\n  uint wvB = (gidx >> 5) * " << 16 * wmmaBStride() << "u;\n  uint wvC = (gidx >> 5) * 256u;\n";
+        if (wmmaUsed) out << "  uint tt = cmt & 1u;\n  uint wvA = (gidx >> 5) * " << 16 * wmmaAStride() * wmmaBatchSize() << "u;\n  uint wvB = (gidx >> 5) * " << 16 * wmmaBStride() * wmmaBatchSize() << "u;\n  uint wvC = (gidx >> 5) * " << 256 * wmmaBatchSize() << "u;\n";
         out << "  uint3 ltid = uint3(cmt % " << LX << "u, (cmt / " << LX << "u) % " << LY << "u, cmt / " << LX * LY << "u);\n";
         out << "  uint3 lsz = uint3(" << LX << "u," << LY << "u," << LZ << "u);\n  uint ngx = 1u, ngy = 1u;\n";
         out << decls.str();
