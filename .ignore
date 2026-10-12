@@ -1,0 +1,11 @@
+# keep ripgrep-based tools (VS Code search, etc.) out of the Wine prefix (its dosdevices/z: symlink points at /) and generated data
+prefix/
+deps/
+vendor/
+third_party/
+x4r/out/
+kernels/
+shots/
+private/
+quality/
+x4r/build/

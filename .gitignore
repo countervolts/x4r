@@ -1,0 +1,29 @@
+# Local SDKs, captured kernels, Wine state, measurements and research.
+/private/
+/RESEARCH.md
+/prefix
+/kernels
+/deps
+/vendor
+/third_party
+/shots
+/quality
+
+# Generated translator/shader outputs and local backups.
+/x4r/build
+/x4r/out
+/build/
+/dist/
+*.log
+*.dxil
+*.spv
+*.dll
+*.exe
+*.bin
+*.bin.dbg
+*.cache
+*.bak_*
+__pycache__/
+*.py[cod]
+.vscode/
+.DS_Store

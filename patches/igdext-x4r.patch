@@ -1,0 +1,664 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 209483d..c18eff2 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -26,6 +26,7 @@ set(SOURCES
+     ${DLL_DIR}/XellHook.cpp
+     ${DLL_DIR}/GpuInfo.cpp
+     ${DLL_DIR}/XellDriver.cpp
++    ${DLL_DIR}/X4r.cpp
+     ${SRC_DIR}/Trace.cpp
+     ${DLL_DIR}/IgdextApiDllInt.cpp
+     ${DLL_DIR}/IgdextApiDllLegacy.cpp
+@@ -57,7 +58,7 @@ target_compile_definitions(igdext PRIVATE
+     INTC_IGDEXT_D3D12
+ )
+ 
+-target_link_libraries(igdext PRIVATE dxgi psapi)
++target_link_libraries(igdext PRIVATE dxgi psapi version advapi32)
+ 
+ set_target_properties(igdext PROPERTIES
+     OUTPUT_NAME "igdext64"
+diff --git a/src/D3D12ExtensionContext.cpp b/src/D3D12ExtensionContext.cpp
+index 81537c5..761e4e1 100644
+--- a/src/D3D12ExtensionContext.cpp
++++ b/src/D3D12ExtensionContext.cpp
+@@ -3,6 +3,7 @@
+ #include "ExtensionVersions.h"
+ #include "dll/GpuInfo.h"
+ extern "C" bool XmxFallbackActive(struct ID3D12Device* dev);   // dll/D3D12Api.cpp
++extern "C" void X4rHookDevice(ID3D12Device* dev);   // x4r
+ 
+ // Highest version we claim: HW feature level 5 (Xe2 and newer), API version 20
+ static const INTCExtensionVersion c_MaxD3D12ExtVersion = {EXTENSION_HW_FEATURE_LEVEL_5, EXTENSION_API_VERSION_20, EXTENSION_REVISION_0};
+@@ -10,6 +11,7 @@ static const INTCExtensionVersion c_MaxD3D12ExtVersion = {EXTENSION_HW_FEATURE_L
+ HRESULT D3D12ExtensionContext::GetSupportedVersions(const void* pDevice, INTCExtensionVersionHelper* driverExtensionVersion)
+ {
+     m_pAppDevice = const_cast<ID3D12Device*>(reinterpret_cast<const ID3D12Device*>(pDevice));
++    X4rHookDevice(m_pAppDevice.Get());   // x4r
+     *driverExtensionVersion = c_MaxD3D12ExtVersion;
+     return S_OK;
+ }
+diff --git a/src/Trace.cpp b/src/Trace.cpp
+index 8ad64cc..f6efcdf 100644
+--- a/src/Trace.cpp
++++ b/src/Trace.cpp
+@@ -59,21 +59,27 @@ bool DumpBlob(const char* name, const void* data, size_t size)
+ const char* SafeStr(const void* p, char* buf, size_t cap)
+ {
+     if (!p) { snprintf(buf, cap, "(null)"); return buf; }
+-    __try {
+-        const char* s = (const char*)p; size_t i = 0;
+-        for (; i + 1 < cap && s[i]; ++i) buf[i] = (s[i] >= 32 && s[i] < 127) ? s[i] : '.';
+-        buf[i] = 0;
+-    } __except (EXCEPTION_EXECUTE_HANDLER) { snprintf(buf, cap, "(unreadable)"); }
++    // x4r: mingw-gcc has no SEH __try; check the page is readable instead (string may not cross into a bad page)
++    MEMORY_BASIC_INFORMATION mbi;
++    const DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
++    if (!VirtualQuery(p, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT || !(mbi.Protect & readable) || (mbi.Protect & PAGE_GUARD))
++    { snprintf(buf, cap, "(unreadable)"); return buf; }
++    const char* s = (const char*)p; size_t i = 0;
++    const char* end = (const char*)mbi.BaseAddress + mbi.RegionSize;
++    for (; i + 1 < cap && s + i < end && s[i]; ++i) buf[i] = (s[i] >= 32 && s[i] < 127) ? s[i] : '.';
++    buf[i] = 0;
+     return buf;
+ }
+ 
+ void StartXellHook();
+-BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID)
++extern "C" void X4rInit(HMODULE self);   // x4r
++BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
+ {
+     if (reason == DLL_PROCESS_ATTACH)
+     {
+         char exe[MAX_PATH] = {}; GetModuleFileNameA(nullptr, exe, MAX_PATH);
+         TraceF("==== igdext64 (tracing build) attached to %s", exe);
++        X4rInit(inst);   // x4r
+         StartXellHook();
+     }
+     return TRUE;
+diff --git a/src/dll/D3D12Api.cpp b/src/dll/D3D12Api.cpp
+index 71520b4..42503b7 100644
+--- a/src/dll/D3D12Api.cpp
++++ b/src/dll/D3D12Api.cpp
+@@ -80,6 +80,11 @@ static int DynKernelId(unsigned long long hash, const void* spv, size_t spvLen,
+     LeaveCriticalSection(&g_dynCs);
+     return id;
+ }
++bool X4rKernelBytecode(unsigned long long kernelHash, D3D12_SHADER_BYTECODE* out);   // x4r
++unsigned long long X4rRootSigHash(ID3D12RootSignature* rs);
++extern "C" void X4rKernelFailed(unsigned long long kernelHash, const char* why);
++extern "C" int X4rGate();
++extern "C" void X4rNotePipeline(ID3D12PipelineState* pso, unsigned long long kernelHash);
+ static ID3D12Device* DevOf(INTCExtensionContext* c) { return (c && c->m_pD3D12ExtensionContext) ? c->m_pD3D12ExtensionContext->m_pAppDevice.Get() : nullptr; }
+ 
+ 
+@@ -239,6 +244,22 @@ HRESULT _INTC_D3D12_CreateComputePipelineState(INTCExtensionContext* ctx, const
+             if (useStatic) for (const XessDummy& xd : kXessDummies)
+                 if (xd.hash == h) { desc.CS.pShaderBytecode = xd.bytes; desc.CS.BytecodeLength = xd.size; TraceF("  kernel hash %016llx -> dummy id %d (workgroup %d,%d,5)", h, xd.id, 1 + xd.id % 16, 1 + xd.id / 16); known = true; break; }
+ #endif
++            TraceF("  x4r: kernel %016llx rootsig %016llx", h, X4rRootSigHash(d->pD3D12Desc->pRootSignature));
++            if (!known && d->ShaderInputType == CM_SPIRV && X4rKernelBytecode(h, &desc.CS))
++            {
++                // x4r: a translated kernel exists: run it for real
++                known = true;
++                HRESULT xhr = dev->CreateComputePipelineState(&desc, riid, pp);
++                TraceF("  -> x4r translated kernel (%zu bytes DXIL) hr=0x%08x", (size_t)desc.CS.BytecodeLength, (unsigned)xhr);
++                if (SUCCEEDED(xhr)) { DynKernelId(h, d->CS.pShaderBytecode, d->CS.BytecodeLength, opts); X4rNotePipeline((ID3D12PipelineState*)*pp, h); return xhr; }
++                X4rKernelFailed(h, "translated pipeline rejected");
++                return xhr;
++            }
++            if (!known && d->ShaderInputType == CM_SPIRV && X4rGate() > 0)
++            {
++                X4rKernelFailed(h, "no translation for this kernel");
++                return E_FAIL;
++            }
+             if (!known && d->ShaderInputType == CM_SPIRV)
+             {
+                 const int dyn = DynKernelId(h, d->CS.pShaderBytecode, d->CS.BytecodeLength, opts);
+@@ -290,10 +311,12 @@ static bool CalledFromXeFG()
+ // If the file is not newer than this process, placeholders would not be replaced - the stock driver is in use (the
+ // session check fell back, the variables are missing) or vkd3d-proton changed how placeholders reach the driver - and
+ // XeSS must use its DP4a path instead of producing noise. IGDEXT_SKIP_SELFTEST=1 skips it.
++extern "C" int X4rGate();   // x4r
+ static bool SelfTestOk(ID3D12Device* dev)
+ {
+     static int result = -1;
+     if (result >= 0) return result == 1;
++    if (const int gate = X4rGate()) { if (gate > 0) { result = 1; return true; } return false; }   // x4r: not cached, XeSS may load later
+     char b[8];
+     if (GetEnvironmentVariableA("IGDEXT_SKIP_SELFTEST", b, sizeof(b)) > 0 && atoi(b)) { result = 1; return true; }
+     result = 0;
+diff --git a/src/dll/IgdextApiDll.cpp b/src/dll/IgdextApiDll.cpp
+index 52f2a49..ffab72e 100644
+--- a/src/dll/IgdextApiDll.cpp
++++ b/src/dll/IgdextApiDll.cpp
+@@ -126,6 +126,7 @@ HRESULT D3D11GetSupportedVersions2(
+     return E_OUTOFMEMORY;
+ }
+ 
++extern "C" void X4rHookDevice(ID3D12Device* dev);   // x4r
+ HRESULT _INTC_D3D12_GetSupportedVersions(
+     const ID3D12Device*   pDevice,
+     INTCExtensionVersion* pSupportedExtVersions,
+@@ -137,6 +138,7 @@ HRESULT _INTC_D3D12_GetSupportedVersions(
+     }
+     constexpr UINT32 NumSupportedVersions = sizeof(SupportedExtVersions) / sizeof(INTCExtensionVersion);
+     TraceF("_INTC_D3D12_GetSupportedVersions(device=%p, list=%p, count=%u)", pDevice, pSupportedExtVersions, *pSupportedExtVersionsCount);
++    X4rHookDevice(const_cast<ID3D12Device*>(pDevice));   // x4r
+     if (pSupportedExtVersions == nullptr)
+     {
+         *pSupportedExtVersionsCount = NumSupportedVersions;
+diff --git a/src/dll/X4r.cpp b/src/dll/X4r.cpp
+new file mode 100644
+index 0000000..7d7ab96
+--- /dev/null
++++ b/src/dll/X4r.cpp
+@@ -0,0 +1,494 @@
++// SPDX-License-Identifier: GPL-3.0-only
++// x4r: AMD backend for XeSS' CM kernels.
++//  * hooks the D3D12 device to record XeSS' root signatures and descriptor views (so translated kernels can declare
++//    matching HLSL registers);
++//  * X4rKernelBytecode(): if C:\x4r\dxil\<hash>.dxil exists (a CM kernel translated to HLSL and compiled to DXIL on the
++//    Linux side), returns it so the real kernel runs instead of the placeholder.
++#include "Stdafx.h"
++#include "Trace.h"
++#include <atomic>
++#include <map>
++#include <mutex>
++#include <string>
++#include <vector>
++
++namespace
++{
++std::mutex g_mx;
++std::string g_dir = "C:\\x4r";          // runtime data: <dll folder>\x4r when that exists (release layout), else the dev folder
++std::string g_ovrDir;                   // shader overrides in use (empty: stock DXIL, which runs on any RDNA2+ GPU)
++std::string g_gpuDesc, g_xessVer = "not loaded", g_profile = "unselected";
++int g_gen = 0;
++std::map<unsigned long long, bool> g_kmode;   // translated kernel hash -> runs as a WMMA override
++std::atomic<unsigned> g_failed{0};
++std::atomic<unsigned long long> g_dispatches{0};
++constexpr const char* kVersion = "0.1.0";
++
++bool DirExists(const std::string& p) { DWORD a = GetFileAttributesA(p.c_str()); return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY); }
++std::string IniValue(const char* key)   // <dir>\x4r.ini: "key = value" lines, '#'/';' comments
++{
++    std::string path = g_dir + "\\x4r.ini", out;
++    if (FILE* f = nullptr; fopen_s(&f, path.c_str(), "rb") == 0 && f)
++    {
++        char line[256];
++        while (fgets(line, sizeof line, f))
++        {
++            char* p = line; while (*p == ' ' || *p == '\t') ++p;
++            size_t n = strlen(key);
++            if (_strnicmp(p, key, n) != 0) continue;
++            p += n; while (*p == ' ' || *p == '\t') ++p;
++            if (*p != '=') continue;
++            ++p; while (*p == ' ' || *p == '\t') ++p;
++            char* e = p + strlen(p); while (e > p && (e[-1] == '\r' || e[-1] == '\n' || e[-1] == ' ' || e[-1] == '\t')) --e;
++            out.assign(p, e - p);
++        }
++        fclose(f);
++    }
++    return out;
++}
++
++// RDNA generation of the first AMD GPU. Wine names it after the Vulkan device ("AMD Radeon RX 7700 XT (RADV NAVI32)");
++// the DXGI ids are no use because the Intel vendor spoof replaces them. 0: unknown or not RDNA3/RDNA4.
++int DetectRdna()
++{
++    HKEY pci;
++    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Enum\\PCI", 0, KEY_READ | KEY_ENUMERATE_SUB_KEYS, &pci) != ERROR_SUCCESS) return 0;
++    int gen = 0;
++    char name[256];
++    for (DWORD i = 0, nl = sizeof name; !gen && RegEnumKeyExA(pci, i, name, &nl, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS; ++i, nl = sizeof name)
++    {
++        if (_strnicmp(name, "VEN_1002&", 9) != 0) continue;
++        HKEY dev;
++        if (RegOpenKeyExA(pci, name, 0, KEY_READ | KEY_ENUMERATE_SUB_KEYS, &dev) != ERROR_SUCCESS) continue;
++        char inst[256];
++        for (DWORD j = 0, il = sizeof inst; !gen && RegEnumKeyExA(dev, j, inst, &il, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS; ++j, il = sizeof inst)
++        {
++            HKEY k;
++            if (RegOpenKeyExA(dev, inst, 0, KEY_READ, &k) != ERROR_SUCCESS) continue;
++            char desc[256] = {}; DWORD n = sizeof desc - 1, type = 0;
++            if (RegQueryValueExA(k, "DeviceDesc", nullptr, &type, (BYTE*)desc, &n) == ERROR_SUCCESS)
++            {
++                const char* r = strstr(desc, "(RADV ");
++                if (r)
++                {
++                    r += 6;
++                    if (!_strnicmp(r, "NAVI3", 5) || !_strnicmp(r, "GFX11", 5) || !_strnicmp(r, "PHOENIX", 7) || !_strnicmp(r, "HAWK", 4)) gen = 3;
++                    else if (!_strnicmp(r, "NAVI4", 5) || !_strnicmp(r, "GFX12", 5)) gen = 4;
++                }
++                if (!gen || !g_gpuDesc.size()) g_gpuDesc = desc;
++                TraceF("x4r: GPU '%s' -> RDNA%d", desc, gen);
++            }
++            RegCloseKey(k);
++        }
++        RegCloseKey(dev);
++    }
++    RegCloseKey(pci);
++    return gen;
++}
++
++// Called once, before XeSS creates its kernels: pick the kernel set that suits this GPU. The int8 WMMA overrides are
++// SPIR-V for VK_KHR_cooperative_matrix and exist per generation (the dyn_29 accumulator layout differs on RDNA4);
++// everything else falls back to the stock DXIL, which needs only dot4.
++void SelectOverrides()
++{
++    char forced[32] = {};
++    GetEnvironmentVariableA("X4R_PROFILE", forced, sizeof forced);          // dxil | rdna3 | rdna4 | auto
++    std::string want = forced[0] ? forced : IniValue("Profile");
++    int gen = 0;
++    const int detected = DetectRdna();
++    if (want == "rdna3") gen = 3; else if (want == "rdna4") gen = 4; else if (want != "dxil") gen = detected;
++    g_gen = detected; g_profile = want.empty() ? "auto" : want;
++    char user[MAX_PATH] = {};
++    if (GetEnvironmentVariableA("VKD3D_SHADER_OVERRIDE", user, sizeof user)) { g_ovrDir = user; TraceF("x4r: VKD3D_SHADER_OVERRIDE preset to %s", user); return; }
++    if (!gen) { TraceF("x4r: profile %s: stock DXIL kernels", want.empty() ? "auto" : want.c_str()); return; }
++    std::string dir = g_dir + (gen == 4 ? "\\ovr-rdna4" : "\\ovr-rdna3");
++    if (!DirExists(dir)) { TraceF("x4r: %s missing: stock DXIL kernels", dir.c_str()); return; }
++    SetEnvironmentVariableA("VKD3D_SHADER_OVERRIDE", dir.c_str());
++    g_ovrDir = dir;
++    TraceF("x4r: RDNA%d WMMA overrides from %s", gen, dir.c_str());
++}
++std::map<ID3D12RootSignature*, unsigned long long> g_rsHash;   // root signature -> FNV-1a of its blob
++std::atomic<int> g_viewLogs{0};
++
++unsigned long long Fnv(const void* p, size_t n)
++{
++    unsigned long long h = 14695981039346656037ull;
++    for (size_t i = 0; i < n; ++i) { h ^= ((const unsigned char*)p)[i]; h *= 1099511628211ull; }
++    return h;
++}
++
++const char* RangeType(D3D12_DESCRIPTOR_RANGE_TYPE t)
++{
++    switch (t) { case D3D12_DESCRIPTOR_RANGE_TYPE_SRV: return "SRV"; case D3D12_DESCRIPTOR_RANGE_TYPE_UAV: return "UAV";
++                 case D3D12_DESCRIPTOR_RANGE_TYPE_CBV: return "CBV"; default: return "SAMPLER"; }
++}
++
++// writes C:\x4r\rs\<hash>.txt: one line per root parameter, then static samplers (parsed by the Linux-side translator)
++void DescribeRootSignature(unsigned long long h, const void* blob, size_t size)
++{
++    if (!getenv("X4R_CAPTURE")) return;     // translation input for the Linux-side tools; not needed to run
++    char path[MAX_PATH]; snprintf(path, sizeof(path), "C:\\x4r\\rs\\%016llx.txt", h);
++    if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) return;
++    CreateDirectoryA("C:\\x4r", nullptr); CreateDirectoryA("C:\\x4r\\rs", nullptr);
++    char bpath[MAX_PATH]; snprintf(bpath, sizeof(bpath), "C:\\x4r\\rs\\%016llx.bin", h);
++    if (FILE* f = nullptr; fopen_s(&f, bpath, "wb") == 0 && f) { fwrite(blob, 1, size, f); fclose(f); }
++    using PFN = HRESULT(WINAPI*)(LPCVOID, SIZE_T, REFIID, void**);
++    auto fn = (PFN)GetProcAddress(GetModuleHandleA("d3d12.dll"), "D3D12CreateVersionedRootSignatureDeserializer");
++    ID3D12VersionedRootSignatureDeserializer* des = nullptr;
++    if (!fn || FAILED(fn(blob, size, __uuidof(ID3D12VersionedRootSignatureDeserializer), (void**)&des)) || !des) return;
++    const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* vd = nullptr;
++    if (SUCCEEDED(des->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1, &vd)) && vd)
++    {
++        const D3D12_ROOT_SIGNATURE_DESC1& d = vd->Desc_1_1;
++        FILE* f = nullptr;
++        if (fopen_s(&f, path, "wb") == 0 && f)
++        {
++            fprintf(f, "flags %u\n", (unsigned)d.Flags);
++            for (UINT i = 0; i < d.NumParameters; ++i)
++            {
++                const D3D12_ROOT_PARAMETER1& p = d.pParameters[i];
++                if (p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
++                {
++                    fprintf(f, "param %u table", i);
++                    for (UINT r = 0; r < p.DescriptorTable.NumDescriptorRanges; ++r)
++                    {
++                        const D3D12_DESCRIPTOR_RANGE1& rg = p.DescriptorTable.pDescriptorRanges[r];
++                        fprintf(f, " %s:%u:%u:%u:%u", RangeType(rg.RangeType), rg.BaseShaderRegister, rg.RegisterSpace,
++                                rg.NumDescriptors, rg.OffsetInDescriptorsFromTableStart);
++                    }
++                    fprintf(f, "\n");
++                }
++                else if (p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS)
++                    fprintf(f, "param %u constants b%u space%u n%u\n", i, p.Constants.ShaderRegister, p.Constants.RegisterSpace, p.Constants.Num32BitValues);
++                else
++                    fprintf(f, "param %u root%s r%u space%u\n", i,
++                            p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV ? "CBV" : p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_SRV ? "SRV" : "UAV",
++                            p.Descriptor.ShaderRegister, p.Descriptor.RegisterSpace);
++            }
++            for (UINT i = 0; i < d.NumStaticSamplers; ++i)
++            {
++                const D3D12_STATIC_SAMPLER_DESC& s = d.pStaticSamplers[i];
++                fprintf(f, "sampler s%u space%u filter %u addr %u %u %u\n", s.ShaderRegister, s.RegisterSpace, (unsigned)s.Filter,
++                        (unsigned)s.AddressU, (unsigned)s.AddressV, (unsigned)s.AddressW);
++            }
++            fclose(f);
++        }
++    }
++    des->Release();
++}
++
++using PFN_CreateRootSignature = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, const void*, SIZE_T, REFIID, void**);
++using PFN_CreateSRV = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_SHADER_RESOURCE_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
++using PFN_CreateUAV = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, ID3D12Resource*, const D3D12_UNORDERED_ACCESS_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
++PFN_CreateRootSignature o_CreateRootSignature;
++PFN_CreateSRV o_CreateSRV;
++PFN_CreateUAV o_CreateUAV;
++
++HRESULT STDMETHODCALLTYPE h_CreateRootSignature(ID3D12Device* dev, UINT mask, const void* blob, SIZE_T size, REFIID riid, void** pp)
++{
++    HRESULT hr = o_CreateRootSignature(dev, mask, blob, size, riid, pp);
++    if (SUCCEEDED(hr) && pp && *pp && blob)
++    {
++        const unsigned long long h = Fnv(blob, size);
++        { std::lock_guard<std::mutex> l(g_mx); g_rsHash[(ID3D12RootSignature*)*pp] = h; }
++        DescribeRootSignature(h, blob, size);
++        TraceF("x4r: CreateRootSignature -> %p hash %016llx (%zu bytes)", *pp, h, (size_t)size);
++    }
++    return hr;
++}
++
++void STDMETHODCALLTYPE h_CreateSRV(ID3D12Device* dev, ID3D12Resource* r, const D3D12_SHADER_RESOURCE_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h)
++{
++    if (d && g_viewLogs++ < 4000)
++    {
++        if (d->ViewDimension == D3D12_SRV_DIMENSION_BUFFER)
++            TraceF("x4r: SRV buffer fmt %d first %llu n %u stride %u flags %u", (int)d->Format, (unsigned long long)d->Buffer.FirstElement,
++                   d->Buffer.NumElements, d->Buffer.StructureByteStride, (unsigned)d->Buffer.Flags);
++        else
++            TraceF("x4r: SRV dim %d fmt %d", (int)d->ViewDimension, (int)d->Format);
++    }
++    o_CreateSRV(dev, r, d, h);
++}
++
++void STDMETHODCALLTYPE h_CreateUAV(ID3D12Device* dev, ID3D12Resource* r, ID3D12Resource* c, const D3D12_UNORDERED_ACCESS_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h)
++{
++    if (d && g_viewLogs++ < 4000)
++    {
++        if (d->ViewDimension == D3D12_UAV_DIMENSION_BUFFER)
++            TraceF("x4r: UAV buffer fmt %d first %llu n %u stride %u flags %u", (int)d->Format, (unsigned long long)d->Buffer.FirstElement,
++                   d->Buffer.NumElements, d->Buffer.StructureByteStride, (unsigned)d->Buffer.Flags);
++        else
++            TraceF("x4r: UAV dim %d fmt %d", (int)d->ViewDimension, (int)d->Format);
++    }
++    o_CreateUAV(dev, r, c, d, h);
++}
++
++
++// <runtime>\status.txt: what this process is really running; x4r-check.sh turns it into a verdict
++void WriteStatus(double xessMs)
++{
++    unsigned wmma = 0;
++    for (auto& kv : g_kmode) wmma += kv.second;
++    const unsigned translated = (unsigned)g_kmode.size(), failed = g_failed;
++    const char* result = failed ? "FAILED" : (translated && g_dispatches) ? "OK" : "PENDING";
++    if (FILE* f = nullptr; fopen_s(&f, (g_dir + "\\status.txt").c_str(), "wb") == 0 && f)
++    {
++        fprintf(f, "x4r=%s\nxess_library=%s\ngpu=%s\nrdna=%d\nprofile=%s\nkernel_set=%s\ntranslated_kernels=%u\nwmma_kernels=%u\n"
++                   "failed_kernels=%u\ndispatches=%llu\nxess_gpu_ms_per_frame=%.3f\nresult=%s\n",
++                kVersion, g_xessVer.c_str(), g_gpuDesc.empty() ? "unknown" : g_gpuDesc.c_str(), g_gen, g_profile.c_str(),
++                g_ovrDir.empty() ? "stock-dxil" : g_ovrDir.c_str(), translated, wmma, failed, (unsigned long long)g_dispatches, xessMs, result);
++        fclose(f);
++    }
++}
++// ---- dispatch log + GPU timing: which translated kernel runs with which group counts and how long it takes on the GPU ----
++std::map<ID3D12PipelineState*, unsigned long long> g_psoHash;
++std::map<void*, ID3D12PipelineState*> g_curPso;
++std::atomic<int> g_dispLogs{0};
++// kernels built with X4R_SPLITZ run (2,1,Z) groups as Z one-wave groups: the dispatch's group z is multiplied by Z (C:\x4r\splitz.txt: "<kernel hash> <Z>" per line)
++std::map<unsigned long long, unsigned> g_splitZ;
++std::once_flag g_splitOnce;
++static void LoadSplitZ()
++{
++    FILE* f = nullptr;
++    if (g_ovrDir.empty()) return;      // the split kernels exist only as overrides
++    if (fopen_s(&f, (g_dir + "\\splitz.txt").c_str(), "rb") != 0 || !f) return;
++    char line[128];
++    while (fgets(line, sizeof line, f)) { unsigned long long h; unsigned zz; if (sscanf(line, "%llx %u", &h, &zz) == 2 && zz > 1) g_splitZ[h] = zz; }
++    fclose(f);
++}
++using PFN_SetPSO = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12PipelineState*);
++using PFN_Dispatch = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT);
++using PFN_Close = HRESULT(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*);
++PFN_SetPSO o_SetPSO;
++PFN_Dispatch o_Dispatch;
++PFN_Close o_Close;
++
++constexpr int kRing = 8, kMaxDisp = 64;            // frames in flight x dispatches per frame
++ID3D12QueryHeap* g_qheap = nullptr;
++ID3D12Resource* g_qread = nullptr;
++UINT64* g_qmap = nullptr;
++double g_tsFreq = 1e9;
++struct Slot { int count = 0; unsigned long long hash[kMaxDisp] = {}; bool resolved = false; bool used = false; };
++Slot g_slots[kRing];
++struct ListState { int slot = -1; };
++std::map<void*, ListState> g_lists;
++int g_nextSlot = 0;
++std::map<unsigned long long, std::pair<double, int>> g_acc;   // per kernel: total ms, dispatch count
++double g_frameMs = 0; int g_frames = 0;
++bool g_timingInit = false, g_timingOk = false;
++
++void InitTiming(ID3D12Device* dev)
++{
++    g_timingInit = true;
++    D3D12_QUERY_HEAP_DESC qd = {}; qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP; qd.Count = kRing * kMaxDisp * 2;
++    if (FAILED(dev->CreateQueryHeap(&qd, __uuidof(ID3D12QueryHeap), (void**)&g_qheap))) return;
++    D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_READBACK;
++    D3D12_RESOURCE_DESC rd = {}; rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = qd.Count * 8; rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
++    rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++    if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, __uuidof(ID3D12Resource), (void**)&g_qread))) return;
++    D3D12_RANGE rr = {0, 0};
++    if (FAILED(g_qread->Map(0, &rr, (void**)&g_qmap))) return;
++    D3D12_COMMAND_QUEUE_DESC cq = {}; cq.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
++    ID3D12CommandQueue* q = nullptr;
++    if (SUCCEEDED(dev->CreateCommandQueue(&cq, __uuidof(ID3D12CommandQueue), (void**)&q))) { UINT64 f = 0; if (SUCCEEDED(q->GetTimestampFrequency(&f)) && f) g_tsFreq = (double)f; q->Release(); }
++    g_timingOk = true;
++    TraceF("x4r: GPU timing enabled, timestamp frequency %.0f Hz", g_tsFreq);
++}
++
++void ConsumeSlot(Slot& sl, int idx)   // read the timestamps of a finished frame
++{
++    if (!sl.used || !sl.resolved) return;
++    double total = 0;
++    for (int d = 0; d < sl.count; ++d)
++    {
++        UINT64 a = g_qmap[(idx * kMaxDisp + d) * 2], b = g_qmap[(idx * kMaxDisp + d) * 2 + 1];
++        double ms = b >= a ? (double)(b - a) * 1000.0 / g_tsFreq : 0;
++        auto& acc = g_acc[sl.hash[d]]; acc.first += ms; acc.second++;
++        total += ms;
++    }
++    g_frameMs += total; ++g_frames;
++    if (g_frames % 120 == 0)
++    {
++        TraceF("x4r: GPU xess time per frame (avg of last 120): %.3f ms", g_frameMs / 120);
++        WriteStatus(g_frameMs / 120);
++        for (auto& kv : g_acc) TraceF("x4r:   kernel %016llx: %.3f ms/frame (%d dispatches/frame)", kv.first, kv.second.first / 120, kv.second.second / 120);
++        g_acc.clear(); g_frameMs = 0;
++    }
++    sl.used = false; sl.resolved = false; sl.count = 0;
++}
++
++void STDMETHODCALLTYPE h_SetPSO(ID3D12GraphicsCommandList* l, ID3D12PipelineState* p)
++{
++    { std::lock_guard<std::mutex> g(g_mx); g_curPso[l] = p; }
++    o_SetPSO(l, p);
++}
++void STDMETHODCALLTYPE h_Dispatch(ID3D12GraphicsCommandList* l, UINT x, UINT y, UINT z)
++{
++    unsigned long long h = 0;
++    int slot = -1, di = -1;
++    {
++        std::lock_guard<std::mutex> g(g_mx);
++        auto it = g_curPso.find(l);
++        if (it != g_curPso.end()) { auto j = g_psoHash.find(it->second); if (j != g_psoHash.end()) h = j->second; }
++        if (h && g_timingOk)
++        {
++            ListState& ls = g_lists[l];
++            if (ls.slot < 0)
++            {
++                ls.slot = g_nextSlot; g_nextSlot = (g_nextSlot + 1) % kRing;
++                ConsumeSlot(g_slots[ls.slot], ls.slot);          // the frame that used this slot kRing lists ago is long finished
++                g_slots[ls.slot].used = true; g_slots[ls.slot].resolved = false; g_slots[ls.slot].count = 0;
++            }
++            slot = ls.slot;
++            if (g_slots[slot].count < kMaxDisp) { di = g_slots[slot].count++; g_slots[slot].hash[di] = h; }
++        }
++    }
++    std::call_once(g_splitOnce, LoadSplitZ);
++    if (h && g_dispatches++ == 0) WriteStatus(0);
++    if (h) { auto sz = g_splitZ.find(h); if (sz != g_splitZ.end()) z *= sz->second; }
++    if (h && g_dispLogs < 600) { ++g_dispLogs; TraceF("x4r: dispatch %016llx %u %u %u", h, x, y, z); }
++    if (di >= 0) l->EndQuery(g_qheap, D3D12_QUERY_TYPE_TIMESTAMP, (slot * kMaxDisp + di) * 2);
++    o_Dispatch(l, x, y, z);
++    if (di >= 0) l->EndQuery(g_qheap, D3D12_QUERY_TYPE_TIMESTAMP, (slot * kMaxDisp + di) * 2 + 1);
++}
++HRESULT STDMETHODCALLTYPE h_Close(ID3D12GraphicsCommandList* l)
++{
++    if (g_timingOk)
++    {
++        int slot = -1, count = 0;
++        {
++            std::lock_guard<std::mutex> g(g_mx);
++            auto it = g_lists.find(l);
++            if (it != g_lists.end() && it->second.slot >= 0) { slot = it->second.slot; count = g_slots[slot].count; g_slots[slot].resolved = true; it->second.slot = -1; }
++        }
++        if (slot >= 0 && count > 0)
++            l->ResolveQueryData(g_qheap, D3D12_QUERY_TYPE_TIMESTAMP, slot * kMaxDisp * 2, count * 2, g_qread, (UINT64)slot * kMaxDisp * 2 * 8);
++    }
++    return o_Close(l);
++}
++
++void Patch(void** vtbl, int idx, void* fn, void** orig)
++{
++    if (vtbl[idx] == fn) return;
++    DWORD old;
++    if (!VirtualProtect(&vtbl[idx], sizeof(void*), PAGE_READWRITE, &old)) return;
++    *orig = vtbl[idx];
++    vtbl[idx] = fn;
++    VirtualProtect(&vtbl[idx], sizeof(void*), old, &old);
++}
++}
++
++// DllMain: locate the runtime folder beside this DLL (<game folder>\x4r), falling back to C:\x4r
++extern "C" void X4rInit(HMODULE self)
++{
++    char p[MAX_PATH] = {};
++    if (!GetModuleFileNameA(self, p, MAX_PATH)) return;
++    char* slash = strrchr(p, '\\');
++    if (!slash) return;
++    *slash = 0;
++    std::string cand = std::string(p) + "\\x4r";
++    if (DirExists(cand)) g_dir = cand;
++}
++
++// 1 on an x4r install (the ANV self-test does not apply), 0 without the x4r runtime (upstream behaviour). A game whose
++// XeSS has kernels we did not translate does not fall back to DP4a: the pipeline creation fails (X4rKernelFailed).
++extern "C" int X4rGate()
++{
++    if (!DirExists(g_dir + "\\dxil")) return 0;
++    HMODULE m = GetModuleHandleA("libxess.dll");
++    char path[MAX_PATH];
++    if (m && GetModuleFileNameA(m, path, MAX_PATH))
++    {
++        DWORD h = 0, n = GetFileVersionInfoSizeA(path, &h);
++        std::vector<char> blob(n ? n : 1);
++        VS_FIXEDFILEINFO* fi = nullptr; UINT len = 0;
++        if (n && GetFileVersionInfoA(path, 0, n, blob.data()) && VerQueryValueA(blob.data(), "\\", (void**)&fi, &len) && fi)
++        {
++            char have[64]; snprintf(have, sizeof have, "%u.%u.%u.%u", HIWORD(fi->dwFileVersionMS), LOWORD(fi->dwFileVersionMS), HIWORD(fi->dwFileVersionLS), LOWORD(fi->dwFileVersionLS));
++            g_xessVer = have;
++        }
++    }
++    return 1;
++}
++
++// A CM kernel without a translation (other XeSS version, translation missing or rejected by the driver): count it and
++// let the caller fail the pipeline, so the problem shows up as an XeSS error and in status.txt, never as noise or a silent fallback.
++extern "C" void X4rKernelFailed(unsigned long long kernelHash, const char* why)
++{
++    ++g_failed;
++    TraceF("x4r: FAILED kernel %016llx: %s (XeSS library %s, runtime expects %s)", kernelHash, why, g_xessVer.c_str(), IniValue("XessVersion").c_str());
++    WriteStatus(0);
++}
++
++extern "C" void X4rHookDevice(ID3D12Device* dev)
++{
++    static std::once_flag once;
++    std::call_once(once, [dev] {
++        SelectOverrides();
++        void** vtbl = *(void***)dev;
++        // ID3D12Device vtable: 16 CreateRootSignature, 18 CreateShaderResourceView, 19 CreateUnorderedAccessView
++        Patch(vtbl, 16, (void*)h_CreateRootSignature, (void**)&o_CreateRootSignature);
++        Patch(vtbl, 18, (void*)h_CreateSRV, (void**)&o_CreateSRV);
++        Patch(vtbl, 19, (void*)h_CreateUAV, (void**)&o_CreateUAV);
++        // ID3D12GraphicsCommandList vtable: 14 Dispatch, 25 SetPipelineState (shared by all lists, so one throwaway list is enough)
++        ID3D12CommandAllocator* al = nullptr; ID3D12GraphicsCommandList* cl = nullptr;
++        if (SUCCEEDED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator), (void**)&al)) &&
++            SUCCEEDED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, al, nullptr, __uuidof(ID3D12GraphicsCommandList), (void**)&cl)))
++        {
++            void** lv = *(void***)cl;
++            Patch(lv, 25, (void*)h_SetPSO, (void**)&o_SetPSO);
++            Patch(lv, 14, (void*)h_Dispatch, (void**)&o_Dispatch);
++            Patch(lv, 9, (void*)h_Close, (void**)&o_Close);
++            if (!g_timingInit) InitTiming(dev);
++            o_Close(cl);
++        }
++        if (cl) cl->Release();
++        if (al) al->Release();
++        TraceF("x4r: device %p hooked", dev);
++    });
++}
++
++unsigned long long X4rRootSigHash(ID3D12RootSignature* rs)
++{
++    std::lock_guard<std::mutex> l(g_mx);
++    auto it = g_rsHash.find(rs);
++    return it == g_rsHash.end() ? 0 : it->second;
++}
++
++// translated kernel for this CM kernel hash, if the Linux side built one (cached for the process lifetime)
++bool X4rKernelBytecode(unsigned long long kernelHash, D3D12_SHADER_BYTECODE* out)
++{
++    static std::mutex m;
++    static std::map<unsigned long long, std::vector<char>> cache;
++    std::lock_guard<std::mutex> l(m);
++    auto it = cache.find(kernelHash);
++    if (it == cache.end())
++    {
++        std::vector<char> data;
++        char path[MAX_PATH]; snprintf(path, sizeof(path), "%s\\dxil\\%016llx.dxil", g_dir.c_str(), kernelHash);
++        if (FILE* f = nullptr; fopen_s(&f, path, "rb") == 0 && f)
++        {
++            fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
++            if (n > 0) { data.resize(n); if (fread(data.data(), 1, n, f) != (size_t)n) data.clear(); }
++            fclose(f);
++        }
++        it = cache.emplace(kernelHash, std::move(data)).first;
++    }
++    if (it->second.empty()) return false;
++    if (!g_kmode.count(kernelHash))
++    {
++        unsigned long long h = 14695981039346656037ull;      // vkd3d names a shader override after the FNV-1 of the DXIL
++        for (char c : it->second) { h *= 1099511628211ull; h ^= (unsigned char)c; }
++        char ov[MAX_PATH]; snprintf(ov, sizeof ov, "%s\\%016llx.spv", g_ovrDir.c_str(), h);
++        g_kmode[kernelHash] = !g_ovrDir.empty() && GetFileAttributesA(ov) != INVALID_FILE_ATTRIBUTES;
++    }
++    out->pShaderBytecode = it->second.data();
++    out->BytecodeLength = it->second.size();
++    return true;
++}
++
++extern "C" void X4rNotePipeline(ID3D12PipelineState* pso, unsigned long long kernelHash)
++{
++    std::lock_guard<std::mutex> l(g_mx);
++    g_psoHash[pso] = kernelHash;
++}
+diff --git a/src/dll/XellDriver.cpp b/src/dll/XellDriver.cpp
+index a8b9d26..b05d61c 100644
+--- a/src/dll/XellDriver.cpp
++++ b/src/dll/XellDriver.cpp
+@@ -126,7 +126,7 @@ HRESULT _INTC_D3D12_RenderSubmitStart(INTCExtensionContext*, uint32_t frameId)
+     static LONG n = 0;
+     if (InterlockedIncrement(&n) <= 40)
+     {
+-        char where[160]; ModuleOffset(_ReturnAddress(), where, sizeof(where));
++        char where[160]; ModuleOffset(__builtin_return_address(0), where, sizeof(where));
+         TraceF("XELLPROBE RenderSubmitStart(frame %u) from %s", frameId, where);
+     }
+     return ProbeVersion() > 0 ? S_OK : E_NOTIMPL;
