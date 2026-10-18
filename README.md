@@ -9,6 +9,8 @@ kernels to the D3D12 application.
 
 This is literally just another PoC, it's not really practical (yet atleast).
 
+currently doesnt work as intended, wip. if you do compile expect ghosting and iffy game support
+
 ## Status
 
 In Ghost of Tsushima through OptiScaler (856×480 input, 2560×1440 output, XeSS network
