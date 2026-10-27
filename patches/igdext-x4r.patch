@@ -153,10 +153,10 @@ index 52f2a49..ffab72e 100644
          *pSupportedExtVersionsCount = NumSupportedVersions;
 diff --git a/src/dll/X4r.cpp b/src/dll/X4r.cpp
 new file mode 100644
-index 0000000..7d3fc77
+index 0000000..3352964
 --- /dev/null
 +++ b/src/dll/X4r.cpp
-@@ -0,0 +1,1081 @@
+@@ -0,0 +1,1084 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +// x4r: AMD backend for XeSS' CM kernels.
 +//  * hooks the D3D12 device to record XeSS' root signatures and descriptor views (so translated kernels can declare
@@ -206,8 +206,9 @@ index 0000000..7d3fc77
 +    return out;
 +}
 +
-+// RDNA generation of the first AMD GPU. Wine names it after the Vulkan device ("AMD Radeon RX 7700 XT (RADV NAVI32)");
-+// the DXGI ids are no use because the Intel vendor spoof replaces them. 0: unknown or not RDNA3/RDNA4.
++// RDNA generation of the first RADV GPU. Wine names it after the Vulkan device ("AMD Radeon RX 7700 XT (RADV NAVI32)");
++// the DXGI ids are no use because the Intel vendor spoof replaces them, and the PCI vendor id is not either: with
++// nvapi spoofing (PROTON_FORCE_NVAPI / DXVK_NVAPI_GPU_ARCH) Wine registers the AMD GPU as VEN_10DE. 0: unknown or not RDNA3/RDNA4.
 +int DetectRdna()
 +{
 +    HKEY pci;
@@ -216,7 +217,6 @@ index 0000000..7d3fc77
 +    char name[256];
 +    for (DWORD i = 0, nl = sizeof name; !gen && RegEnumKeyExA(pci, i, name, &nl, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS; ++i, nl = sizeof name)
 +    {
-+        if (_strnicmp(name, "VEN_1002&", 9) != 0) continue;
 +        HKEY dev;
 +        if (RegOpenKeyExA(pci, name, 0, KEY_READ | KEY_ENUMERATE_SUB_KEYS, &dev) != ERROR_SUCCESS) continue;
 +        char inst[256];
@@ -234,8 +234,11 @@ index 0000000..7d3fc77
 +                    if (!_strnicmp(r, "NAVI3", 5) || !_strnicmp(r, "GFX11", 5) || !_strnicmp(r, "PHOENIX", 7) || !_strnicmp(r, "HAWK", 4)) gen = 3;
 +                    else if (!_strnicmp(r, "NAVI4", 5) || !_strnicmp(r, "GFX12", 5)) gen = 4;
 +                }
-+                if (!gen || !g_gpuDesc.size()) g_gpuDesc = desc;
-+                TraceF("x4r: GPU '%s' -> RDNA%d", desc, gen);
++                if (r || !_strnicmp(name, "VEN_1002&", 9))
++                {
++                    if (!gen || !g_gpuDesc.size()) g_gpuDesc = desc;
++                    TraceF("x4r: GPU '%s' (%s) -> RDNA%d", desc, name, gen);
++                }
 +            }
 +            RegCloseKey(k);
 +        }
