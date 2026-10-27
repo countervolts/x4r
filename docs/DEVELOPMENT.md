@@ -107,6 +107,22 @@ After editing the shim, regenerate `patches/igdext-x4r.patch`
 (`git add -N src/dll/X4r.cpp && git diff --relative` in the shim); packaging
 refuses a stale patch.
 
+The mapped set also includes HDR + automatic-exposure input processing
+(`dyn_46`) and output filtering (`dyn_47`), required by Ready or Not. The
+`build-all.sh` recipe builds every ID in `map.txt`; `build-fast.sh` includes the
+new output-filter override. For initialization-only probes, `bench-upscale.exe`
+accepts `XESS_FLAGS`, `XESS_MODEL` and `XESS_BUILD`. Nondefault flags are rejected
+for its benchmark dispatch, which only supplies high-resolution motion vectors.
+
+`quality-capture.sh` replays a prepared fixture into a new isolated output
+directory without installing into a game. `quality-ghost-compare.py` additionally
+requires SciPy and reports both whole-image and vacated-object metrics. Example:
+
+```bash
+XESS_FLAGS=258 XESS_QUALITY=100 X4R_IW=856 X4R_IH=480 XESS_MODEL=0 XESS_BUILD=1 \
+  x4r/tools/quality-capture.sh wmma quality/motion3x-obj-mv private/ron-motion motion
+```
+
 ## Things learned the hard way
 
 - **The SPIR-V overrides must bind the static sampler like vkd3d does** (descriptor set 3,
@@ -134,3 +150,10 @@ refuses a stale patch.
   environment exported checks the exact build that ships.
 - dyn_41, dyn_39, dyn_35, dyn_33 are the network kernel of the other XeSS setups; dyn_40,
   38, 34, 32, 42, 43 the history/first-layer family; they share dyn_29's and dyn_2's profiles.
+
+The expanded set contains 130 kernels captured across 96 common init-flag
+combinations. Ready or Not's responsive-mask variant uses `dyn_75` for input
+processing and `dyn_103` for output filtering; `build-fast.sh` includes the
+latter. For its motion replay use `XESS_FLAGS=266` and `X4R_MASK_VALUE=0.5`.
+The quality harness supplies an R8 responsive-mask texture when requested.
+Captured init coverage is not universal game compatibility.

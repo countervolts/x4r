@@ -13,6 +13,10 @@ echo "Kernel set   : $(get kernel_set)"
 echo "Kernels      : $(get translated_kernels) translated, $(get wmma_kernels) on WMMA, $(get failed_kernels) failed"
 echo "Dispatches   : $(get dispatches)   XeSS GPU time/frame: $(get xess_gpu_ms_per_frame) ms"
 echo "Last update  : ${age}s ago"
+if [[ -f $HERE/frame-sync-status.txt ]]; then
+  echo 'Frame-sync trial:'
+  sed -n '/^frame_sync_/p' "$HERE/frame-sync-status.txt"
+fi
 case $(get result) in
   OK) echo 'PASS: XeSS ran its Intel XMX network through x4r kernels (matrix work on AMD WMMA; no Intel XMX hardware).'
       (( $(get wmma_kernels) > 0 )) || echo 'note: no WMMA kernels in use (stock dot4 set): correct but slower.'; exit 0 ;;

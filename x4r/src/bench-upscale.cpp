@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 #include "xess/xess_d3d12.h"
+#include "xess/xess_debug.h"
 using Microsoft::WRL::ComPtr;
 static void hr(HRESULT r) { if(FAILED(r)) throw std::runtime_error("D3D12 HRESULT="+std::to_string((unsigned)r)); }
 static void xe(xess_result_t r) { if(r<0) throw std::runtime_error("XeSS result="+std::to_string(r)); }
@@ -37,8 +38,11 @@ int main(int argc,char** argv) try {
     HANDLE event=CreateEvent(nullptr,FALSE,FALSE,nullptr); UINT64 serial=0;
     auto wait=[&] {hr(queue->Signal(fence.Get(),++serial)); hr(fence->SetEventOnCompletion(serial,event)); if(WaitForSingleObject(event,120000)!=WAIT_OBJECT_0) throw std::runtime_error("GPU timeout");};
     xess_context_handle_t ctx=nullptr; xe(xessD3D12CreateContext(dev.Get(),&ctx));
+    if(getenv("XESS_MODEL")) xe(xessSelectNetworkModel(ctx,(xess_network_model_t)atoi(getenv("XESS_MODEL"))));
     xe(xessForceLegacyScaleFactors(ctx,true)); // Explicit requested 2x input, independent of SDK defaults.
-    xess_d3d12_init_params_t init={}; init.outputResolution={W,H}; init.qualitySetting=quality?XESS_QUALITY_SETTING_QUALITY:XESS_QUALITY_SETTING_PERFORMANCE; init.initFlags=XESS_INIT_FLAG_HIGH_RES_MV;
+    xess_d3d12_init_params_t init={}; init.outputResolution={W,H}; init.qualitySetting=quality?XESS_QUALITY_SETTING_QUALITY:XESS_QUALITY_SETTING_PERFORMANCE; init.initFlags=getenv("XESS_FLAGS")?(unsigned)atoi(getenv("XESS_FLAGS")):XESS_INIT_FLAG_HIGH_RES_MV;
+    if(getenv("XESS_BUILD")) xe(xessD3D12BuildPipelines(ctx,nullptr,true,init.initFlags));
+    if(init.initFlags!=XESS_INIT_FLAG_HIGH_RES_MV && !(argc==5 && strcmp(argv[4],"init")==0)) throw std::runtime_error("Nondefault flags are supported for init-only capture, not benchmark dispatch");
     xe(xessD3D12Init(ctx,&init));
     xess_2d_t size; xe(xessGetInputResolution(ctx,&init.outputResolution,init.qualitySetting,&size));
     IW=size.x;IH=size.y;

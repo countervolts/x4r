@@ -26,7 +26,10 @@ motion vectors and a moving object) they match the stock kernels to about 60 dB 
 score 28.5–31 dB sRGB against a supersampled reference, within about 1 dB of XeSS's
 own DP4a path; the moving object is where XeSS's XMX network is weakest, and a
 mirror-image test (`quality-mirror.py`) shows no direction-dependent error in the
-translation. In the game the picture is clean in motion. The XMX path has not been
+translation. Severe in-game ghosting has been reported with both the WMMA and
+stock DXIL profiles, including through native XeSS and FSR inputs. The moving-object
+fixture also shows stronger trails than DP4a; the cause is still unresolved.
+The XMX path has not been
 shown to look *better* than DP4a: that needs real Intel XMX output as a reference.
 
 XeSS selects its Intel extension/CM kernel path. x4r translates those kernels

@@ -14,7 +14,7 @@ x4r_fast_profile() {
       export X4R_WORD_GATHER=1 X4R_EFORM_MIN=5 X4R_FWD_DEPTH=128
       [[ $target != spirv ]] || export X4R_NATIVE_MIXED_DOT=1
       ;;
-    29|33|35|39|41)   # dyn_33/35/39/41 are the same network kernel built for the other XeSS setups (OptiScaler, Ghost of Tsushima)
+    29|33|35|39|41|47|103)   # output-filter family; Ready or Not auto-exposure and responsive-mask variants
       export X4R_WMMA_SCATTERA=1 X4R_WMMA_SINGLE=1 X4R_WMMA_CACHE=9
       [[ $rdna != 3 ]] || export X4R_WMMA_REGC=1      # row=2*component+tt, col=lane is the gfx11 wave32 layout only
       ;;
@@ -25,6 +25,6 @@ x4r_fast_profile() {
     *) echo "No validated fast profile for dyn_$kernel" >&2; return 2 ;;
   esac
   case "$kernel" in
-    7|26|29|33|35|39|41) export X4R_WMMA_ASTRIDE=12 X4R_WMMA_BSTRIDE=12 ;;
+    7|26|29|33|35|39|41|47|103) export X4R_WMMA_ASTRIDE=12 X4R_WMMA_BSTRIDE=12 ;;
   esac
 }

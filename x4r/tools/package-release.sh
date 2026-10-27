@@ -57,11 +57,17 @@ cp -r "$RT/ovr-rdna4" "$X/ovr-rdna4"
 cp "$RT/splitz.txt" "$X/"
 cp "$R/packaging/"{x4r.ini,x4r-check.sh,uninstall.sh,VERSION} "$X/"
 cp "$R/packaging/README.txt" "$STAGE/X4R_README.txt"
+cp "$R/docs/GHOSTING_AUDIT.md" "$STAGE/X4R_GHOSTING_AUDIT.md"
+cp "$R/docs/FRAME_SYNC_TRIAL.md" "$STAGE/X4R_FRAME_SYNC_TRIAL.md"
 chmod +x "$X/"*.sh
 cp "$R/LICENSE" "$X/licenses/x4r-LICENSE-GPL-3.0.txt"
 cp "$R/LICENSES/"* "$X/licenses/"
 cp "$R/THIRD_PARTY.md" "$X/licenses/"
 cp "$R/patches/igdext-x4r.patch" "$X/source/"
+mkdir -p "$X/source/x4r" "$X/source/docs"
+cp -r "$R/x4r/src" "$R/x4r/tools" "$X/source/x4r/"
+cp "$R/docs/DEVELOPMENT.md" "$R/docs/GHOSTING_AUDIT.md" "$X/source/docs/"
+cp "$R/docs/FRAME_SYNC_TRIAL.md" "$X/source/docs/"
 cat > "$X/source/SOURCES.txt" <<SRC
 x4r $VERSION  https://github.com/countervolts/x4r  (GPL-3.0-only)
 x4r.asi (and the igdext64.dll it installs) = xess-xmx-linux commit c8d481cf7a46b86645e2ffa12f665840b1665980

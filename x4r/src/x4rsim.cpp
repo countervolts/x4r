@@ -14,7 +14,9 @@
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
+#include <array>
 #include <barrier>
+#include <iterator>
 #include <functional>
 #include <cmath>
 #include <cstdint>
@@ -111,6 +113,12 @@ static vector<vector<uint8_t>> bufs;   // 0..46 as in vkrun: SRV t -> t, UAV u -
 static vector<uint8_t> slm;
 static const unsigned IMW = 128, IMH = 128;
 static std::map<int, vector<float>> imgs;   // binding -> RGBA32F texels
+// X4R_REAL mode: resources loaded from a shim dump (real sizes), bilinear clamp sampling, real group ids
+static bool g_real = false;
+static unsigned GX = 0, GY = 0, GZ = 0;
+static std::map<int, std::pair<unsigned, unsigned>> imdim;   // binding -> width, height
+static unsigned imW(int i) { auto it = imdim.find(i); return it == imdim.end() ? IMW : it->second.first; }
+static unsigned imH(int i) { auto it = imdim.find(i); return it == imdim.end() ? IMH : it->second.second; }
 static unsigned LX, LY, LZ;
 static unsigned trLo = 0, trHi = ~0u;
 
@@ -280,7 +288,7 @@ struct Thread
             int s = it != argRes.end() ? it->second : -1; surf[&C] = s; uint32_t v = s < 0 ? 0 : s; memcpy(&r.b[0], &v, 4); return r;
         }
         auto set64 = [&](uint64_t v) { memcpy(&r.b[0], &v, 8); return r; };
-        if (nme == "_Z12get_group_idj") return set64(0);
+        if (nme == "_Z12get_group_idj") { unsigned d = u32(C.getArgOperand(0)); return set64(d == 0 ? GX : d == 1 ? GY : GZ); }
         if (nme == "_Z12get_local_idj") { unsigned d = u32(C.getArgOperand(0)); return set64(d == 0 ? tid % LX : d == 1 ? (tid / LX) % LY : tid / (LX * LY)); }
         if (nme == "_Z14get_local_sizej") { unsigned d = u32(C.getArgOperand(0)); return set64(d == 0 ? LX : d == 1 ? LY : LZ); }
         if (nme == "_Z19get_local_linear_idv" || nme == "_Z20get_global_linear_idv") return set64(tid);
@@ -377,7 +385,8 @@ struct Thread
         {
             uint8_t* p;
             if (isSlm) { if ((uint64_t)addr + bytes > slm.size()) die("slm out of range"); p = &slm[addr]; }
-            else { int bi = bufIndex(s); if (bufs[bi].size() < (uint64_t)addr + bytes) die("buffer oob"); p = &bufs[bi][addr]; }
+            else { int bi = bufIndex(s); if (g_real && bufs[bi].size() < (uint64_t)addr + bytes) { if (!st) memset(data, 0, bytes); return; }   // out of bounds: reads 0, writes dropped (as on the GPU)
+                   if (bufs[bi].size() < (uint64_t)addr + bytes) die("buffer oob: binding " + std::to_string(bi) + " addr " + std::to_string(addr) + " bytes " + std::to_string(bytes) + " size " + std::to_string(bufs[bi].size())); p = &bufs[bi][addr]; }
             if (st) memcpy(p, data, bytes); else memcpy(data, p, bytes);
         };
         if (starts("llvm.genx.oword.ld")) { int s = surfaceOf(C.getArgOperand(1)); uint32_t off = u32(C.getArgOperand(2)); if (nme.find("unaligned") == string::npos) off *= 16; blk(s, false, off, r.b.size(), r.b.data(), false); return r; }
@@ -423,17 +432,32 @@ struct Thread
         {
             bool smp = starts("llvm.genx.3d.sample");
             int ch = cint(C.getArgOperand(2)); int sidx = surfaceOf(C.getArgOperand(smp ? 5 : 4)); unsigned ub = smp ? 6 : 5;
-            auto& im = imgs[bufIndex(sidx)]; if (im.empty()) die("3d op on missing image");
+            const int bi3 = bufIndex(sidx); auto& im = imgs[bi3]; if (im.empty()) die("3d op on missing image");
+            const unsigned W3 = imW(bi3), H3 = imH(bi3);
             vector<int> chans; for (int c = 0; c < 4; ++c) if (ch & (1 << c)) chans.push_back(c);
             unsigned lanes = nElem(AT(1));
             for (unsigned l = 0; l < lanes; ++l)
             {
                 if (!(getU(A(1), AT(1), l) & 1)) continue;
                 int x, y;
-                if (smp) { float u = getF(A(ub), AT(ub), l), v = getF(A(ub + 1), AT(ub + 1), l); x = (int)floorf(u * IMW); y = (int)floorf(v * IMH); }   // harness sampler = nearest
+                if (smp && g_real)   // XeSS' static sampler: bilinear, clamp
+                {
+                    float u = getF(A(ub), AT(ub), l) * W3 - 0.5f, v = getF(A(ub + 1), AT(ub + 1), l) * H3 - 0.5f;
+                    int x0 = (int)floorf(u), y0 = (int)floorf(v); float fx = u - x0, fy = v - y0;
+                    auto cx = [&](int a) { return a < 0 ? 0 : a >= (int)W3 ? (int)W3 - 1 : a; }; auto cy = [&](int a) { return a < 0 ? 0 : a >= (int)H3 ? (int)H3 - 1 : a; };
+                    for (size_t q = 0; q < chans.size(); ++q)
+                    {
+                        auto T = [&](int xx, int yy) { return im[((size_t)cy(yy) * W3 + cx(xx)) * 4 + chans[q]]; };
+                        float val = (T(x0, y0) * (1 - fx) + T(x0 + 1, y0) * fx) * (1 - fy) + (T(x0, y0 + 1) * (1 - fx) + T(x0 + 1, y0 + 1) * fx) * fy;
+                        setF(r, rt, q * lanes + l, val);
+                    }
+                    continue;
+                }
+                if (smp) { float u = getF(A(ub), AT(ub), l), v = getF(A(ub + 1), AT(ub + 1), l); x = (int)floorf(u * W3); y = (int)floorf(v * H3); }   // harness sampler = nearest
                 else { x = (int)getU(A(ub), AT(ub), l); y = (int)getU(A(ub + 1), AT(ub + 1), l); }
-                x = x < 0 ? 0 : x >= (int)IMW ? IMW - 1 : x; y = y < 0 ? 0 : y >= (int)IMH ? IMH - 1 : y;
-                for (size_t q = 0; q < chans.size(); ++q) setF(r, rt, q * lanes + l, im[(y * IMW + x) * 4 + chans[q]]);
+                if (g_real && !smp && (x < 0 || y < 0 || x >= (int)W3 || y >= (int)H3)) { for (size_t q = 0; q < chans.size(); ++q) setF(r, rt, q * lanes + l, 0.0f); continue; }   // ld out of bounds: 0
+                x = x < 0 ? 0 : x >= (int)W3 ? W3 - 1 : x; y = y < 0 ? 0 : y >= (int)H3 ? H3 - 1 : y;
+                for (size_t q = 0; q < chans.size(); ++q) setF(r, rt, q * lanes + l, im[((size_t)y * W3 + x) * 4 + chans[q]]);
             }
             return r;
         }
@@ -441,7 +465,8 @@ struct Thread
         {
             bool st = starts("llvm.genx.lsc.store");
             int ch = cint(C.getArgOperand(3)); int sidx = surfaceOf(C.getArgOperand(4));
-            auto& im = imgs[bufIndex(sidx)]; if (im.empty()) die("typed op on missing image");
+            const int biT = bufIndex(sidx); auto& im = imgs[biT]; if (im.empty()) die("typed op on missing image");
+            const unsigned WT = imW(biT), HT = imH(biT);
             vector<int> chans; for (int c = 0; c < 4; ++c) if (ch & (1 << c)) chans.push_back(c);
             unsigned lanes = nElem(AT(0)); Val& data = A(9);
             if (!st) r = data;
@@ -449,10 +474,10 @@ struct Thread
             {
                 if (!(getU(A(0), AT(0), l) & 1)) continue;
                 unsigned x = (unsigned)getU(A(5), AT(5), l), y = (unsigned)getU(A(6), AT(6), l);
-                if (x >= IMW || y >= IMH) continue;
+                if (x >= WT || y >= HT) continue;
                 for (size_t q = 0; q < chans.size(); ++q)
                 {
-                    float& t = im[(y * IMW + x) * 4 + chans[q]];
+                    float& t = im[((size_t)y * WT + x) * 4 + chans[q]];
                     if (st) t = getF(data, AT(9), q * lanes + l); else setF(r, rt, q * lanes + l, t);
                 }
             }
@@ -483,7 +508,7 @@ struct Thread
                 }
                 if (isa<ReturnInst>(I)) return;
                 Val v = exec(I);
-                if (!I.getType()->isVoidTy()) { vals[&I] = v; (*trace)[&I] = v; }
+                if (!I.getType()->isVoidTy()) { vals[&I] = v; if (!g_real) (*trace)[&I] = v; }
             }
             prev = bb; bb = next;
         }
@@ -509,6 +534,61 @@ int main(int argc, char** argv)
           if (params.size() <= pi) params.resize(pi + 1); params[pi] = r; } }
     int ri = 0;
     for (auto& A : K->args()) { string tn; raw_string_ostream o(tn); A.getType()->print(o); o.flush(); if (tn.find("spirv.Sampler") != string::npos) continue; resv.push_back(params[ri + 1]); argRes[&A] = ri++; }
+    if (const char* real = getenv("X4R_REAL"))   // X4R_REAL=<dump dir>/<tag>_pre_  X4R_GROUPS=gx0,gy0,nx,ny  X4R_OUT=<prefix>: run real data
+    {
+        g_real = true; trHi = 0;
+        const string pre = real, dir = pre.substr(0, pre.find_last_of('/') + 1), tag = pre.substr(dir.size());
+        std::map<string, std::array<unsigned, 4>> tex;   // register -> width, height, DXGI format, row pitch
+        { std::ifstream mf(dir + "manifest.txt"); string line;
+          while (std::getline(mf, line)) { std::istringstream ls(line); string name, kind; ls >> name >> kind; if (name.rfind(tag, 0) != 0 || kind != "texture") continue;
+              string dims, w1, w2; unsigned fmt, pitch, w, h; ls >> dims >> w1 >> fmt >> w2 >> pitch; sscanf(dims.c_str(), "%ux%u", &w, &h); tex[name.substr(tag.size())] = {w, h, fmt, pitch}; } }
+        bufs.resize(56);
+        for (int si = 0; si < (int)resv.size(); ++si)
+        {
+            const Res& r = resv[si]; const char k = r.kind == "SRV" ? 't' : r.kind == "UAV" ? 'u' : 'b';
+            const int bi = k == 't' ? (int)r.reg : k == 'u' ? 16 + (int)r.reg : 32 + (int)r.reg;
+            const string reg = string(1, k) + std::to_string(r.reg);
+            std::ifstream f(pre + reg + ".bin", std::ios::binary); vector<uint8_t> raw((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            auto it = tex.find(reg);
+            if (it == tex.end()) { raw.resize(std::max<size_t>(raw.size(), k == 'b' ? 65536 : 16)); bufs[bi] = raw; continue; }
+            const unsigned w = it->second[0], h = it->second[1], fmt = it->second[2], pitch = it->second[3];
+            imdim[bi] = {w, h}; auto& im = imgs[bi]; im.assign((size_t)w * h * 4, 0.0f);
+            for (unsigned y = 0; y < h; ++y) for (unsigned x = 0; x < w; ++x)
+            {
+                float* o = &im[((size_t)y * w + x) * 4]; o[3] = 1; const uint8_t* q = &raw[(size_t)y * pitch]; uint16_t v;
+                switch (fmt)
+                {
+                case 10: for (int c = 0; c < 4; ++c) { memcpy(&v, q + x * 8 + c * 2, 2); o[c] = h2f(v); } break;   // R16G16B16A16_FLOAT
+                case 34: for (int c = 0; c < 2; ++c) { memcpy(&v, q + x * 4 + c * 2, 2); o[c] = h2f(v); } break;   // R16G16_FLOAT
+                case 54: memcpy(&v, q + x * 2, 2); o[0] = h2f(v); break;                                          // R16_FLOAT
+                case 41: memcpy(&o[0], q + x * 4, 4); break;                                                      // R32_FLOAT
+                case 2: memcpy(o, q + x * 16, 16); break;                                                         // R32G32B32A32_FLOAT
+                case 61: o[0] = q[x] / 255.0f; break;                                                             // R8_UNORM
+                case 28: for (int c = 0; c < 4; ++c) o[c] = q[x * 4 + c] / 255.0f; break;                         // R8G8B8A8_UNORM
+                default: die("texture format " + std::to_string(fmt));
+                }
+            }
+        }
+        unsigned g0x = 0, g0y = 0, nx = 1, ny = 1;
+        if (const char* g = getenv("X4R_GROUPS")) sscanf(g, "%u,%u,%u,%u", &g0x, &g0y, &nx, &ny);
+        const unsigned slmB = K->hasFnAttribute("VCSLMSize") ? atoi(K->getFnAttribute("VCSLMSize").getValueAsString().str().c_str()) : 0;
+        for (GY = g0y; GY < g0y + ny; ++GY) for (GX = g0x; GX < g0x + nx; ++GX)
+        {
+            slm.assign(std::max(slmB, 4u) + 64, 0);
+            vector<std::map<Instruction*, Val>> traces(T); std::barrier<> bar(T); vector<std::thread> th; vector<Thread*> ts;
+            for (unsigned t = 0; t < T; ++t) { auto* x = new Thread(); x->tid = t; x->trace = &traces[t]; x->F = K; x->bar = &bar; ts.push_back(x); th.emplace_back([x] { x->run(); }); }
+            for (auto& t : th) t.join();
+            for (auto* x : ts) delete x;
+        }
+        const string out = getenv("X4R_OUT") ? getenv("X4R_OUT") : "real_";
+        for (const Res& r : resv)
+        {
+            if (r.kind != "UAV") continue;
+            const int bi = 16 + (int)r.reg; std::ofstream o(out + "u" + std::to_string(r.reg) + ".bin", std::ios::binary);
+            if (imgs.count(bi)) o.write((const char*)imgs[bi].data(), imgs[bi].size() * 4); else o.write((const char*)bufs[bi].data(), bufs[bi].size());
+        }
+        return 0;
+    }
     // resources: identical to vkrun (seed 12345): buffers first (types from the layout file), then sampled images
     enum { T_SBUF, T_UBO, T_TEX, T_RWTEX, T_SAMP, T_DBG, T_NONE };
     vector<int> type(56); for (int i = 0; i < 56; ++i) type[i] = i < 32 ? T_SBUF : i < 47 ? T_UBO : i == 47 ? T_DBG : T_NONE;

@@ -153,10 +153,10 @@ index 52f2a49..ffab72e 100644
          *pSupportedExtVersionsCount = NumSupportedVersions;
 diff --git a/src/dll/X4r.cpp b/src/dll/X4r.cpp
 new file mode 100644
-index 0000000..6896073
+index 0000000..7d3fc77
 --- /dev/null
 +++ b/src/dll/X4r.cpp
-@@ -0,0 +1,583 @@
+@@ -0,0 +1,1081 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +// x4r: AMD backend for XeSS' CM kernels.
 +//  * hooks the D3D12 device to record XeSS' root signatures and descriptor views (so translated kernels can declare
@@ -271,6 +271,59 @@ index 0000000..6896073
 +    TraceF("x4r: RDNA%d WMMA overrides from %s", gen, dir.c_str());
 +}
 +std::map<ID3D12RootSignature*, unsigned long long> g_rsHash;   // root signature -> FNV-1a of its blob
++
++// ---- X4R_DUMP=<kernel hash>:<n>[,<hash>:<n>...] (debug): copy every resource bound to the n-th dispatch (0-based) of a
++// translated kernel, before ("pre") and after ("post") it runs, into <dir>\dump, to check kernels on real data ----
++struct ViewRec { int kind = 0; ID3D12Resource* res = nullptr; DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN; UINT64 va = 0, size = 0; };   // kind 1 SRV, 2 UAV, 3 CBV
++struct HeapRec { SIZE_T cpu; UINT64 gpu; UINT n; };
++struct RangeRec { int type; UINT base, count, offset; };      // type: D3D12_DESCRIPTOR_RANGE_TYPE
++struct ParamRec { int type; UINT reg = 0, n = 0; std::vector<RangeRec> ranges; };   // type: D3D12_ROOT_PARAMETER_TYPE
++struct ListBind { unsigned long long rs = 0; std::map<UINT, UINT64> tables, rootVa; std::map<UINT, std::vector<UINT>> consts; };
++struct Pending { std::string name; ID3D12Resource* rb; UINT64 bytes; };
++bool g_dumpOn = false;
++ID3D12Device* g_dev = nullptr;
++UINT g_inc = 0;
++std::map<SIZE_T, ViewRec> g_views;
++std::vector<HeapRec> g_heaps;
++std::map<unsigned long long, std::vector<ParamRec>> g_rsParams;
++std::map<ID3D12RootSignature*, unsigned long long> g_rsObj;
++std::map<UINT64, std::pair<UINT64, ID3D12Resource*>> g_bufs;   // GPU VA -> (size, buffer)
++std::map<void*, ListBind> g_bind;
++std::map<unsigned long long, std::map<int, bool>> g_dumpWant; std::map<unsigned long long, int> g_dumpSeen;
++std::map<unsigned long long, std::vector<Pending>> g_pending;
++
++void DumpBindings(ID3D12GraphicsCommandList* l, const std::string& tag, std::vector<Pending>& out);
++void FlushDumps(std::vector<Pending>& ps);
++
++void ParseRootSignature(unsigned long long h, const void* blob, size_t size)
++{
++    using PFN = HRESULT(WINAPI*)(LPCVOID, SIZE_T, REFIID, void**);
++    auto fn = (PFN)GetProcAddress(GetModuleHandleA("d3d12.dll"), "D3D12CreateVersionedRootSignatureDeserializer");
++    ID3D12VersionedRootSignatureDeserializer* des = nullptr;
++    if (!fn || FAILED(fn(blob, size, __uuidof(ID3D12VersionedRootSignatureDeserializer), (void**)&des)) || !des) return;
++    const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* vd = nullptr;
++    if (SUCCEEDED(des->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1, &vd)) && vd)
++    {
++        std::vector<ParamRec> ps;
++        for (UINT i = 0; i < vd->Desc_1_1.NumParameters; ++i)
++        {
++            const D3D12_ROOT_PARAMETER1& p = vd->Desc_1_1.pParameters[i];
++            ParamRec r; r.type = p.ParameterType;
++            if (p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
++                for (UINT k = 0; k < p.DescriptorTable.NumDescriptorRanges; ++k)
++                {
++                    const D3D12_DESCRIPTOR_RANGE1& g = p.DescriptorTable.pDescriptorRanges[k];
++                    r.ranges.push_back({(int)g.RangeType, g.BaseShaderRegister, g.NumDescriptors, g.OffsetInDescriptorsFromTableStart});
++                }
++            else if (p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) { r.reg = p.Constants.ShaderRegister; r.n = p.Constants.Num32BitValues; }
++            else r.reg = p.Descriptor.ShaderRegister;
++            ps.push_back(r);
++        }
++        std::lock_guard<std::mutex> l(g_mx); g_rsParams[h] = ps;
++    }
++    des->Release();
++}
++
 +std::atomic<int> g_viewLogs{0};
 +
 +unsigned long long Fnv(const void* p, size_t n)
@@ -355,6 +408,7 @@ index 0000000..6896073
 +        const unsigned long long h = Fnv(blob, size);
 +        { std::lock_guard<std::mutex> l(g_mx); g_rsHash[(ID3D12RootSignature*)*pp] = h; }
 +        DescribeRootSignature(h, blob, size);
++        if (g_dumpOn) ParseRootSignature(h, blob, size);
 +        TraceF("x4r: CreateRootSignature -> %p hash %016llx (%zu bytes)", *pp, h, (size_t)size);
 +    }
 +    return hr;
@@ -370,6 +424,7 @@ index 0000000..6896073
 +        else
 +            TraceF("x4r: SRV dim %d fmt %d", (int)d->ViewDimension, (int)d->Format);
 +    }
++    if (g_dumpOn) { ViewRec v; v.kind = 1; v.res = r; v.fmt = d ? d->Format : DXGI_FORMAT_UNKNOWN; std::lock_guard<std::mutex> l(g_mx); g_views[h.ptr] = v; }
 +    o_CreateSRV(dev, r, d, h);
 +}
 +
@@ -383,11 +438,13 @@ index 0000000..6896073
 +        else
 +            TraceF("x4r: UAV dim %d fmt %d", (int)d->ViewDimension, (int)d->Format);
 +    }
++    if (g_dumpOn) { ViewRec v; v.kind = 2; v.res = r; v.fmt = d ? d->Format : DXGI_FORMAT_UNKNOWN; std::lock_guard<std::mutex> l(g_mx); g_views[h.ptr] = v; }
 +    o_CreateUAV(dev, r, c, d, h);
 +}
 +
 +
 +// <runtime>\status.txt: what this process is really running; x4r-check.sh turns it into a verdict
++void WriteFrameSyncStatus(FILE* f);
 +void WriteStatus(double xessMs)
 +{
 +    unsigned wmma = 0;
@@ -400,6 +457,7 @@ index 0000000..6896073
 +                   "failed_kernels=%u\ndispatches=%llu\nxess_gpu_ms_per_frame=%.3f\nresult=%s\n",
 +                kVersion, g_xessVer.c_str(), g_gpuDesc.empty() ? "unknown" : g_gpuDesc.c_str(), g_gen, g_profile.c_str(),
 +                g_ovrDir.empty() ? "stock-dxil" : g_ovrDir.c_str(), translated, wmma, failed, (unsigned long long)g_dispatches, xessMs, result);
++        WriteFrameSyncStatus(f);
 +        fclose(f);
 +    }
 +}
@@ -425,6 +483,132 @@ index 0000000..6896073
 +PFN_SetPSO o_SetPSO;
 +PFN_Dispatch o_Dispatch;
 +PFN_Close o_Close;
++using PFN_Reset = HRESULT(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12CommandAllocator*, ID3D12PipelineState*);
++using PFN_ClearState = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12PipelineState*);
++PFN_Reset o_Reset;
++PFN_ClearState o_ClearState;
++std::map<void*, bool> g_xessLists;
++std::atomic<bool> g_frameSync{false};
++bool g_frameSyncRequested = false;
++std::atomic<unsigned long long> g_syncCompleted{0}, g_syncSkipped{0}, g_syncTimeouts{0};
++std::mutex g_syncReportMx;
++void WriteFrameSyncStatus(FILE* f)
++{
++    fprintf(f, "frame_sync_requested=%u\nframe_sync_active=%u\nframe_sync_completed=%llu\nframe_sync_skipped_waits=%llu\nframe_sync_timeouts=%llu\n",
++            g_frameSyncRequested ? 1u : 0u, g_frameSync ? 1u : 0u, (unsigned long long)g_syncCompleted.load(),
++            (unsigned long long)g_syncSkipped.load(), (unsigned long long)g_syncTimeouts.load());
++}
++void WriteFrameSyncReport(ID3D12CommandQueue* q, UINT64 value, ID3D12CommandList* list)
++{
++    std::lock_guard<std::mutex> lock(g_syncReportMx);
++    FILE* f = nullptr;
++    if (fopen_s(&f, (g_dir + "\\frame-sync-status.txt").c_str(), "wb") == 0 && f) {
++        WriteFrameSyncStatus(f);
++        fprintf(f, "queue=%p\nqueue_fence=%llu\ncommand_list=%p\n", q, (unsigned long long)value, list);
++        fclose(f);
++    }
++}
++
++HRESULT STDMETHODCALLTYPE h_Reset(ID3D12GraphicsCommandList* l, ID3D12CommandAllocator* a, ID3D12PipelineState* p)
++{
++    HRESULT hr = o_Reset(l, a, p);
++    if (SUCCEEDED(hr)) { std::lock_guard<std::mutex> lock(g_mx); g_curPso[l] = p; g_xessLists[l] = false; g_bind.erase(l); }
++    return hr;
++}
++void STDMETHODCALLTYPE h_ClearState(ID3D12GraphicsCommandList* l, ID3D12PipelineState* p)
++{
++    o_ClearState(l, p);
++    std::lock_guard<std::mutex> lock(g_mx); g_curPso[l] = p; g_bind.erase(l);
++}
++
++// Reversible frame-overlap trial. Preserve normal submission when disabled.
++// Pending GPU queue waits may depend on CPU submissions which have not happened
++// yet: never block the submitting CPU in that case. Bound every other CPU wait.
++using PFN_ExecuteLists = void(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
++using PFN_QueueWait = HRESULT(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64);
++PFN_ExecuteLists o_ExecuteLists;
++PFN_QueueWait o_QueueWait;
++struct FrameQueue {
++    Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
++    Microsoft::WRL::ComPtr<ID3D12Fence> fence;
++    std::vector<std::pair<Microsoft::WRL::ComPtr<ID3D12Fence>, UINT64>> waits;
++    std::mutex mutex;
++    HANDLE event = nullptr;
++    UINT64 serial = 0;
++    ~FrameQueue() { if (event) CloseHandle(event); }
++};
++std::mutex g_queueMx;
++std::map<ID3D12CommandQueue*, std::shared_ptr<FrameQueue>> g_frameQueues;
++std::shared_ptr<FrameQueue> FrameQueueFor(ID3D12CommandQueue* q)
++{
++    std::lock_guard<std::mutex> lock(g_queueMx);
++    auto& s = g_frameQueues[q];
++    if (!s) { s = std::make_shared<FrameQueue>(); s->queue = q; }
++    return s;
++}
++HRESULT STDMETHODCALLTYPE h_QueueWait(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 value)
++{
++    if (!g_frameSync) return o_QueueWait(q, f, value);
++    auto s = FrameQueueFor(q);
++    std::lock_guard<std::mutex> lock(s->mutex);
++    HRESULT hr = o_QueueWait(q, f, value);
++    if (SUCCEEDED(hr) && f->GetCompletedValue() < value) {
++        Microsoft::WRL::ComPtr<ID3D12Fence> keep = f; s->waits.emplace_back(std::move(keep), value);
++    }
++    return hr;
++}
++void STDMETHODCALLTYPE h_ExecuteLists(ID3D12CommandQueue* q, UINT count, ID3D12CommandList* const* lists)
++{
++    if (!g_frameSync) { o_ExecuteLists(q, count, lists); return; }
++    std::vector<bool> marked(count, false); bool any = false;
++    { std::lock_guard<std::mutex> lock(g_mx);
++      for (UINT i = 0; i < count; ++i) { auto it = g_xessLists.find(lists[i]); marked[i] = it != g_xessLists.end() && it->second; any |= marked[i]; } }
++    if (!any) { o_ExecuteLists(q, count, lists); return; }
++    auto s = FrameQueueFor(q);
++    std::lock_guard<std::mutex> lock(s->mutex);
++    // Give already-submitted upstream GPU work a short chance to finish. A
++    // fence which needs a later CPU submission remains unresolved: skip rather
++    // than deadlocking that submitting thread.
++    const ULONGLONG deadline = GetTickCount64() + 50;
++    do {
++        s->waits.erase(std::remove_if(s->waits.begin(), s->waits.end(), [](const auto& w) { return w.first->GetCompletedValue() >= w.second; }), s->waits.end());
++        if (s->waits.empty() || GetTickCount64() >= deadline) break;
++        Sleep(1);
++    } while (true);
++    if (!s->waits.empty()) {
++        ++g_syncSkipped; TraceF("x4r: frame-sync skipped: unresolved GPU queue wait, queue %p", q);
++        WriteFrameSyncReport(q, s->serial, nullptr);
++        o_ExecuteLists(q, count, lists); return;
++    }
++    if (!s->fence) {
++        Microsoft::WRL::ComPtr<ID3D12Device> d;
++        if (FAILED(q->GetDevice(__uuidof(ID3D12Device), (void**)d.GetAddressOf())) ||
++            FAILED(d->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), (void**)s->fence.GetAddressOf())) ||
++            !(s->event = CreateEventA(nullptr, FALSE, FALSE, nullptr))) {
++            g_frameSync = false; TraceF("x4r: frame-sync disabled: fence/event creation failed");
++            WriteFrameSyncReport(q, s->serial, nullptr);
++            o_ExecuteLists(q, count, lists); return;
++        }
++    }
++    for (UINT i = 0; i < count; ++i) {
++        o_ExecuteLists(q, 1, &lists[i]);
++        if (!marked[i] || !g_frameSync) continue;
++        const UINT64 value = ++s->serial;
++        HRESULT hr = q->Signal(s->fence.Get(), value);
++        if (SUCCEEDED(hr)) hr = s->fence->SetEventOnCompletion(value, s->event);
++        if (FAILED(hr) || WaitForSingleObject(s->event, 2000) != WAIT_OBJECT_0) {
++            ++g_syncTimeouts; g_frameSync = false;
++            TraceF("x4r: frame-sync disabled: fence wait failed/timed out, queue %p serial %llu", q, (unsigned long long)value);
++            WriteFrameSyncReport(q, value, lists[i]);
++        } else {
++            const auto done = ++g_syncCompleted;
++            if (done <= 20 || done % 120 == 0) {
++                TraceF("x4r: frame-sync completed %llu queue %p serial %llu list %p", done, q, (unsigned long long)value, lists[i]);
++                WriteFrameSyncReport(q, value, lists[i]);
++            }
++        }
++    }
++}
 +
 +constexpr int kRing = 8, kMaxDisp = 640;            // frames in flight x dispatches per frame
 +ID3D12QueryHeap* g_qheap = nullptr;
@@ -500,6 +684,7 @@ index 0000000..6896073
 +        std::lock_guard<std::mutex> g(g_mx);
 +        auto it = g_curPso.find(l);
 +        if (it != g_curPso.end()) { auto j = g_psoHash.find(it->second); if (j != g_psoHash.end()) h = j->second; }
++        if (h) g_xessLists[l] = true;
 +        if (h && g_timingOk)
 +        {
 +            ListState& ls = g_lists[l];
@@ -516,9 +701,47 @@ index 0000000..6896073
 +    std::call_once(g_splitOnce, LoadSplitZ);
 +    if (h && g_dispatches++ == 0) WriteStatus(0);
 +    if (h) { auto sz = g_splitZ.find(h); if (sz != g_splitZ.end()) z *= sz->second; }
-+    if (h && g_dispLogs < 600) { ++g_dispLogs; TraceF("x4r: dispatch %016llx %u %u %u", h, x, y, z); }
++    if (h && g_dispLogs < 600) { ++g_dispLogs; TraceF("x4r: dispatch %016llx %u %u %u list %p", h, x, y, z, (void*)l); }
++    else if (!h && g_dumpOn && g_dispLogs < 600) { ++g_dispLogs; void* pso = nullptr; { std::lock_guard<std::mutex> g(g_mx); auto it = g_curPso.find(l); if (it != g_curPso.end()) pso = it->second; }
++        TraceF("x4r: dispatch NATIVE pso %p %u %u %u list %p", pso, x, y, z, (void*)l); }
++    int dumpOcc = -1;
++    if (h && g_dumpOn)
++    {
++        std::vector<Pending> done;
++        {
++            std::lock_guard<std::mutex> g(g_mx);
++            auto w = g_dumpWant.find(h);
++            if (w != g_dumpWant.end())
++            {
++                const int occ = g_dumpSeen[h]++;
++                const int last = w->second.rbegin()->first;
++                if (w->second.count(occ)) dumpOcc = occ;
++                else if (occ == last + 1) done.swap(g_pending[h]);   // the next frame: the captured dispatches have finished on the GPU
++            }
++        }
++        if (!done.empty()) { FlushDumps(done); TraceF("x4r: dump of kernel %016llx written", h); }
++    }
++    char tag[64] = {};
++    if (dumpOcc >= 0)
++    {
++        snprintf(tag, sizeof tag, "k%016llx_n%d", h, dumpOcc);
++        if (FILE* m = nullptr; fopen_s(&m, (g_dir + "\\dump\\manifest.txt").c_str(), "ab") == 0 && m) { fprintf(m, "# %s dispatch %u %u %u\n", tag, x, y, z); fclose(m); }
++        std::vector<Pending> pre; DumpBindings(l, std::string(tag) + "_pre", pre);
++        std::lock_guard<std::mutex> g(g_mx); auto& v = g_pending[h]; v.insert(v.end(), pre.begin(), pre.end());
++    }
++    static std::map<unsigned long long, bool> skip = [] { std::map<unsigned long long, bool> m; char b[4096] = {};   // debug: X4R_SKIP=<hash>,... drops those dispatches
++        if (GetEnvironmentVariableA("X4R_SKIP", b, sizeof b)) for (char* t = strtok(b, ","); t; t = strtok(nullptr, ",")) m[strtoull(t, nullptr, 16)] = true; return m; }();
++    if (h && skip.count(h)) return;
++    static const bool serialize = GetEnvironmentVariableA("X4R_SERIALIZE", nullptr, 0) > 0;   // debug: full UAV barrier before every translated dispatch
++    if (h && serialize) { D3D12_RESOURCE_BARRIER ub = {}; ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; l->ResourceBarrier(1, &ub); }
 +    if (di >= 0) l->EndQuery(g_qheap, D3D12_QUERY_TYPE_TIMESTAMP, (slot * kMaxDisp + di) * 2);
 +    o_Dispatch(l, x, y, z);
++    if (dumpOcc >= 0)
++    {
++        D3D12_RESOURCE_BARRIER ub = {}; ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; l->ResourceBarrier(1, &ub);
++        std::vector<Pending> post; DumpBindings(l, std::string(tag) + "_post", post);
++        std::lock_guard<std::mutex> g(g_mx); auto& v = g_pending[h]; v.insert(v.end(), post.begin(), post.end());
++    }
 +    if (di >= 0) l->EndQuery(g_qheap, D3D12_QUERY_TYPE_TIMESTAMP, (slot * kMaxDisp + di) * 2 + 1);
 +}
 +HRESULT STDMETHODCALLTYPE h_Close(ID3D12GraphicsCommandList* l)
@@ -545,6 +768,232 @@ index 0000000..6896073
 +    *orig = vtbl[idx];
 +    vtbl[idx] = fn;
 +    VirtualProtect(&vtbl[idx], sizeof(void*), old, &old);
++}
++
++using PFN_CreateHeap = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_DESCRIPTOR_HEAP_DESC*, REFIID, void**);
++using PFN_CreateCBV = void(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_CONSTANT_BUFFER_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
++using PFN_CopyDescs = void(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, const UINT*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, const UINT*, D3D12_DESCRIPTOR_HEAP_TYPE);
++using PFN_CopyDescsSimple = void(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_DESCRIPTOR_HEAP_TYPE);
++using PFN_CreateCommitted = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, REFIID, void**);
++using PFN_CreatePlaced = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Heap*, UINT64, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, REFIID, void**);
++using PFN_SetRS = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12RootSignature*);
++using PFN_SetTable = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, D3D12_GPU_DESCRIPTOR_HANDLE);
++using PFN_SetConst = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT);
++using PFN_SetConsts = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, const void*, UINT);
++using PFN_SetRootVa = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, D3D12_GPU_VIRTUAL_ADDRESS);
++PFN_CreateHeap o_CreateHeap; PFN_CreateCBV o_CreateCBV; PFN_CopyDescs o_CopyDescs; PFN_CopyDescsSimple o_CopyDescsSimple;
++PFN_CreateCommitted o_CreateCommitted; PFN_CreatePlaced o_CreatePlaced;
++using PFN_CopyBuf = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12Resource*, UINT64, ID3D12Resource*, UINT64, UINT64);
++using PFN_CopyRes = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12Resource*, ID3D12Resource*);
++PFN_CopyBuf o_CopyBuf; PFN_CopyRes o_CopyRes;
++void STDMETHODCALLTYPE h_CopyBuf(ID3D12GraphicsCommandList* l, ID3D12Resource* d, UINT64 doff, ID3D12Resource* s, UINT64 soff, UINT64 n)
++{
++    long nz = -1;   // nonzero bytes in the source range when the source is CPU-visible (upload heap), read at record time
++    D3D12_HEAP_PROPERTIES hp = {}; D3D12_HEAP_FLAGS hf;
++    if (s && SUCCEEDED(s->GetHeapProperties(&hp, &hf)) && hp.Type == D3D12_HEAP_TYPE_UPLOAD)
++    {
++        void* m = nullptr; D3D12_RANGE r = {(SIZE_T)soff, (SIZE_T)(soff + n)};
++        if (SUCCEEDED(s->Map(0, &r, &m)) && m) { nz = 0; for (UINT64 i = 0; i < n; ++i) nz += ((const unsigned char*)m)[soff + i] != 0; D3D12_RANGE e = {0, 0}; s->Unmap(0, &e); }
++    }
++    TraceF("x4r: copybuf list %p dst %p+%llu src %p+%llu n %llu src_nonzero %ld", (void*)l, (void*)d, (unsigned long long)doff, (void*)s, (unsigned long long)soff, (unsigned long long)n, nz);
++    o_CopyBuf(l, d, doff, s, soff, n);
++}
++void STDMETHODCALLTYPE h_CopyRes(ID3D12GraphicsCommandList* l, ID3D12Resource* d, ID3D12Resource* s)
++{ TraceF("x4r: copyres dst %p src %p", (void*)d, (void*)s); o_CopyRes(l, d, s); }
++PFN_SetRS o_SetRS; PFN_SetTable o_SetTable; PFN_SetConst o_SetConst; PFN_SetConsts o_SetConsts; PFN_SetRootVa o_SetRootCbv, o_SetRootSrv, o_SetRootUav;
++
++HRESULT STDMETHODCALLTYPE h_CreateHeap(ID3D12Device* d, const D3D12_DESCRIPTOR_HEAP_DESC* desc, REFIID riid, void** pp)
++{
++    HRESULT hr = o_CreateHeap(d, desc, riid, pp);
++    if (SUCCEEDED(hr) && pp && *pp && desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && (desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE))
++    {
++        ID3D12DescriptorHeap* h = (ID3D12DescriptorHeap*)*pp;
++        std::lock_guard<std::mutex> l(g_mx);
++        g_heaps.push_back({h->GetCPUDescriptorHandleForHeapStart().ptr, h->GetGPUDescriptorHandleForHeapStart().ptr, desc->NumDescriptors});
++    }
++    return hr;
++}
++void STDMETHODCALLTYPE h_CreateCBV(ID3D12Device* d, const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE h)
++{
++    if (desc) { ViewRec v; v.kind = 3; v.va = desc->BufferLocation; v.size = desc->SizeInBytes; std::lock_guard<std::mutex> l(g_mx); g_views[h.ptr] = v; }
++    o_CreateCBV(d, desc, h);
++}
++void STDMETHODCALLTYPE h_CopyDescsSimple(ID3D12Device* d, UINT n, D3D12_CPU_DESCRIPTOR_HANDLE dst, D3D12_CPU_DESCRIPTOR_HANDLE src, D3D12_DESCRIPTOR_HEAP_TYPE t)
++{
++    if (t == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
++    {
++        std::lock_guard<std::mutex> l(g_mx);
++        for (UINT i = 0; i < n; ++i) { auto it = g_views.find(src.ptr + i * g_inc); if (it != g_views.end()) g_views[dst.ptr + i * g_inc] = it->second; else g_views.erase(dst.ptr + i * g_inc); }
++    }
++    o_CopyDescsSimple(d, n, dst, src, t);
++}
++void STDMETHODCALLTYPE h_CopyDescs(ID3D12Device* d, UINT nd, const D3D12_CPU_DESCRIPTOR_HANDLE* ds, const UINT* dn, UINT ns, const D3D12_CPU_DESCRIPTOR_HANDLE* ss, const UINT* sn, D3D12_DESCRIPTOR_HEAP_TYPE t)
++{
++    if (t == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
++    {
++        std::vector<SIZE_T> src, dst;
++        for (UINT i = 0; i < ns; ++i) for (UINT k = 0; k < (sn ? sn[i] : 1); ++k) src.push_back(ss[i].ptr + k * g_inc);
++        for (UINT i = 0; i < nd; ++i) for (UINT k = 0; k < (dn ? dn[i] : 1); ++k) dst.push_back(ds[i].ptr + k * g_inc);
++        std::lock_guard<std::mutex> l(g_mx);
++        for (size_t i = 0; i < src.size() && i < dst.size(); ++i) { auto it = g_views.find(src[i]); if (it != g_views.end()) g_views[dst[i]] = it->second; else g_views.erase(dst[i]); }
++    }
++    o_CopyDescs(d, nd, ds, dn, ns, ss, sn, t);
++}
++void RecordBuffer(void** pp, const D3D12_RESOURCE_DESC* d)
++{
++    if (!pp || !*pp || d->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) return;
++    ID3D12Resource* r = (ID3D12Resource*)*pp;
++    std::lock_guard<std::mutex> l(g_mx); g_bufs[r->GetGPUVirtualAddress()] = {d->Width, r};
++}
++HRESULT STDMETHODCALLTYPE h_CreateCommitted(ID3D12Device* dv, const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS f, const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_STATES s, const D3D12_CLEAR_VALUE* c, REFIID riid, void** pp)
++{
++    HRESULT hr = o_CreateCommitted(dv, hp, f, d, s, c, riid, pp);
++    if (SUCCEEDED(hr)) RecordBuffer(pp, d);
++    if (SUCCEEDED(hr) && pp && *pp) TraceF("x4r: res %p committed heap %d dim %d %llux%u fmt %d state %x", *pp, hp ? (int)hp->Type : -1, (int)d->Dimension, (unsigned long long)d->Width, d->Height, (int)d->Format, (unsigned)s);
++    return hr;
++}
++HRESULT STDMETHODCALLTYPE h_CreatePlaced(ID3D12Device* dv, ID3D12Heap* heap, UINT64 off, const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_STATES s, const D3D12_CLEAR_VALUE* c, REFIID riid, void** pp)
++{
++    HRESULT hr = o_CreatePlaced(dv, heap, off, d, s, c, riid, pp);
++    if (SUCCEEDED(hr)) RecordBuffer(pp, d);
++    if (SUCCEEDED(hr) && pp && *pp) TraceF("x4r: res %p placed heap %p off %llu dim %d %llux%u fmt %d state %x", *pp, (void*)heap, (unsigned long long)off, (int)d->Dimension, (unsigned long long)d->Width, d->Height, (int)d->Format, (unsigned)s);
++    return hr;
++}
++void STDMETHODCALLTYPE h_SetRS(ID3D12GraphicsCommandList* l, ID3D12RootSignature* rs)
++{
++    { std::lock_guard<std::mutex> g(g_mx); ListBind& b = g_bind[l]; b = ListBind(); auto it = g_rsHash.find(rs); b.rs = it == g_rsHash.end() ? 0 : it->second; }
++    o_SetRS(l, rs);
++}
++void STDMETHODCALLTYPE h_SetTable(ID3D12GraphicsCommandList* l, UINT p, D3D12_GPU_DESCRIPTOR_HANDLE h)
++{
++    { std::lock_guard<std::mutex> g(g_mx); g_bind[l].tables[p] = h.ptr; }
++    o_SetTable(l, p, h);
++}
++void STDMETHODCALLTYPE h_SetConst(ID3D12GraphicsCommandList* l, UINT p, UINT v, UINT off)
++{
++    { std::lock_guard<std::mutex> g(g_mx); auto& c = g_bind[l].consts[p]; if (c.size() <= off) c.resize(off + 1); c[off] = v; }
++    o_SetConst(l, p, v, off);
++}
++void STDMETHODCALLTYPE h_SetConsts(ID3D12GraphicsCommandList* l, UINT p, UINT n, const void* v, UINT off)
++{
++    { std::lock_guard<std::mutex> g(g_mx); auto& c = g_bind[l].consts[p]; if (c.size() < off + n) c.resize(off + n); memcpy(&c[off], v, n * 4); }
++    o_SetConsts(l, p, n, v, off);
++}
++void STDMETHODCALLTYPE h_SetRootCbv(ID3D12GraphicsCommandList* l, UINT p, D3D12_GPU_VIRTUAL_ADDRESS va) { { std::lock_guard<std::mutex> g(g_mx); g_bind[l].rootVa[p] = va; } o_SetRootCbv(l, p, va); }
++void STDMETHODCALLTYPE h_SetRootSrv(ID3D12GraphicsCommandList* l, UINT p, D3D12_GPU_VIRTUAL_ADDRESS va) { { std::lock_guard<std::mutex> g(g_mx); g_bind[l].rootVa[p] = va; } o_SetRootSrv(l, p, va); }
++void STDMETHODCALLTYPE h_SetRootUav(ID3D12GraphicsCommandList* l, UINT p, D3D12_GPU_VIRTUAL_ADDRESS va) { { std::lock_guard<std::mutex> g(g_mx); g_bind[l].rootVa[p] = va; } o_SetRootUav(l, p, va); }
++
++// buffer holding a GPU VA (exact start or inside): (resource, offset)
++std::pair<ID3D12Resource*, UINT64> BufferAt(UINT64 va)
++{
++    auto it = g_bufs.upper_bound(va);
++    if (it == g_bufs.begin()) return {nullptr, 0};
++    --it;
++    if (va >= it->first + it->second.first) return {nullptr, 0};
++    return {it->second.second, va - it->first};
++}
++
++// records copies of one bound resource into a readback buffer; state is the one the binding implies
++void CopyOut(ID3D12GraphicsCommandList* l, ID3D12Resource* r, D3D12_RESOURCE_STATES state, const std::string& name, FILE* man, std::vector<Pending>& out, UINT64 off = 0, UINT64 len = 0)
++{
++    D3D12_RESOURCE_DESC d = r->GetDesc();
++    D3D12_HEAP_PROPERTIES hp = {}; D3D12_HEAP_FLAGS hf; r->GetHeapProperties(&hp, &hf);
++    const bool barrier = hp.Type == D3D12_HEAP_TYPE_DEFAULT || hp.Type == D3D12_HEAP_TYPE_CUSTOM;
++    UINT64 bytes = 0; D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
++    if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) { if (!len) { off = 0; len = d.Width; } bytes = len; }
++    else { UINT rows; UINT64 rs; g_dev->GetCopyableFootprints(&d, 0, 1, 0, &fp, &rows, &rs, &bytes); }
++    D3D12_HEAP_PROPERTIES rh = {}; rh.Type = D3D12_HEAP_TYPE_READBACK;
++    D3D12_RESOURCE_DESC rd = {}; rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = bytes; rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
++    rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++    ID3D12Resource* rb = nullptr;
++    if (FAILED(o_CreateCommitted(g_dev, &rh, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, __uuidof(ID3D12Resource), (void**)&rb))) return;
++    D3D12_RESOURCE_BARRIER b = {}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b.Transition = {r, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, state, D3D12_RESOURCE_STATE_COPY_SOURCE};
++    if (barrier) l->ResourceBarrier(1, &b);
++    if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) l->CopyBufferRegion(rb, 0, r, off, bytes);
++    else
++    {
++        D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
++        dst.pResource = rb; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint = fp;
++        src.pResource = r; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = 0;
++        l->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
++    }
++    std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
++    if (barrier) l->ResourceBarrier(1, &b);
++    out.push_back({name, rb, bytes});
++    if (man)
++    {
++        if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) fprintf(man, "%s buffer bytes %llu offset %llu res %p\n", name.c_str(), (unsigned long long)bytes, (unsigned long long)off, (void*)r);
++        else fprintf(man, "%s texture %llux%u fmt %d rowpitch %u bytes %llu res %p\n", name.c_str(), (unsigned long long)d.Width, d.Height, (int)d.Format,
++                     fp.Footprint.RowPitch, (unsigned long long)bytes, (void*)r);
++    }
++}
++
++void DumpBindings(ID3D12GraphicsCommandList* l, const std::string& tag, std::vector<Pending>& out)
++{
++    std::lock_guard<std::mutex> g(g_mx);
++    const ListBind& b = g_bind[l];
++    FILE* man = nullptr; fopen_s(&man, (g_dir + "\\dump\\manifest.txt").c_str(), "ab");
++    if (man) fprintf(man, "# %s rootsig %016llx\n", tag.c_str(), b.rs);
++    auto ps = g_rsParams.find(b.rs);
++    if (ps == g_rsParams.end()) { if (man) { fprintf(man, "# root signature not parsed\n"); fclose(man); } return; }
++    for (UINT pi = 0; pi < ps->second.size(); ++pi)
++    {
++        const ParamRec& p = ps->second[pi];
++        if (p.type == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS)
++        {
++            auto c = b.consts.find(pi);
++            if (man) { fprintf(man, "%s_rootconst_b%u n %u:", tag.c_str(), p.reg, p.n); if (c != b.consts.end()) for (UINT v : c->second) fprintf(man, " %08x", v); fprintf(man, "\n"); }
++            continue;
++        }
++        if (p.type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
++        {
++            auto v = b.rootVa.find(pi);
++            if (v == b.rootVa.end()) continue;
++            auto [r, off] = BufferAt(v->second);
++            const char k = p.type == D3D12_ROOT_PARAMETER_TYPE_CBV ? 'b' : p.type == D3D12_ROOT_PARAMETER_TYPE_SRV ? 't' : 'u';
++            if (r) CopyOut(l, r, k == 'u' ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : k == 'b' ? D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
++                           tag + "_root" + k + std::to_string(p.reg), man, out, off, 0);
++            continue;
++        }
++        auto t = b.tables.find(pi);
++        if (t == b.tables.end()) continue;
++        UINT run = 0;
++        for (const RangeRec& rg : p.ranges)
++        {
++            const UINT start = rg.offset == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND ? run : rg.offset;
++            const UINT count = rg.count == UINT_MAX ? 1 : rg.count;
++            for (UINT i = 0; i < count; ++i)
++            {
++                const UINT64 gh = t->second + (UINT64)(start + i) * g_inc;
++                const char k = rg.type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV ? 't' : rg.type == D3D12_DESCRIPTOR_RANGE_TYPE_UAV ? 'u' : rg.type == D3D12_DESCRIPTOR_RANGE_TYPE_CBV ? 'b' : 's';
++                const std::string name = tag + "_" + k + std::to_string(rg.base + i);
++                const ViewRec* v = nullptr;
++                for (const HeapRec& h : g_heaps)
++                    if (gh >= h.gpu && gh < h.gpu + (UINT64)h.n * g_inc) { auto it = g_views.find(h.cpu + (SIZE_T)(gh - h.gpu)); if (it != g_views.end()) v = &it->second; break; }
++                if (!v) { if (man && k != 's') fprintf(man, "%s missing\n", name.c_str()); continue; }
++                if (v->kind == 3) { auto [r, off] = BufferAt(v->va); if (r) CopyOut(l, r, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, name, man, out, off, v->size); else if (man) fprintf(man, "%s cbv not found\n", name.c_str()); }
++                else if (v->res) CopyOut(l, v->res, v->kind == 2 ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, name, man, out);
++                if (man && v->kind != 3) fprintf(man, "%s view fmt %d\n", name.c_str(), (int)v->fmt);
++            }
++            run = start + count;
++        }
++    }
++    if (man) fclose(man);
++}
++
++void FlushDumps(std::vector<Pending>& ps)
++{
++    for (Pending& p : ps)
++    {
++        void* m = nullptr; D3D12_RANGE r = {0, (SIZE_T)p.bytes};
++        if (SUCCEEDED(p.rb->Map(0, &r, &m)) && m)
++        {
++            if (FILE* f = nullptr; fopen_s(&f, (g_dir + "\\dump\\" + p.name + ".bin").c_str(), "wb") == 0 && f) { fwrite(m, 1, (size_t)p.bytes, f); fclose(f); }
++            D3D12_RANGE e = {0, 0}; p.rb->Unmap(0, &e);
++        }
++        p.rb->Release();
++    }
++    ps.clear();
 +}
 +}
 +
@@ -668,6 +1117,27 @@ index 0000000..6896073
 +        Patch(vtbl, 16, (void*)h_CreateRootSignature, (void**)&o_CreateRootSignature);
 +        Patch(vtbl, 18, (void*)h_CreateSRV, (void**)&o_CreateSRV);
 +        Patch(vtbl, 19, (void*)h_CreateUAV, (void**)&o_CreateUAV);
++        char want[1024] = {};
++        if (GetEnvironmentVariableA("X4R_DUMP", want, sizeof want))
++        {
++            for (char* t = strtok(want, ","); t; t = strtok(nullptr, ","))
++            { unsigned long long kh; int n; if (sscanf(t, "%llx:%d", &kh, &n) == 2) g_dumpWant[kh][n] = true; }
++            g_dumpOn = !g_dumpWant.empty();
++        }
++        if (g_dumpOn)
++        {
++            g_dev = dev; g_inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
++            CreateDirectoryA((g_dir + "\\dump").c_str(), nullptr);
++            // ID3D12Device vtable: 14 CreateDescriptorHeap, 17 CreateConstantBufferView, 23 CopyDescriptors, 24 CopyDescriptorsSimple,
++            // 27 CreateCommittedResource, 29 CreatePlacedResource
++            Patch(vtbl, 14, (void*)h_CreateHeap, (void**)&o_CreateHeap);
++            Patch(vtbl, 17, (void*)h_CreateCBV, (void**)&o_CreateCBV);
++            Patch(vtbl, 23, (void*)h_CopyDescs, (void**)&o_CopyDescs);
++            Patch(vtbl, 24, (void*)h_CopyDescsSimple, (void**)&o_CopyDescsSimple);
++            Patch(vtbl, 27, (void*)h_CreateCommitted, (void**)&o_CreateCommitted);
++            Patch(vtbl, 29, (void*)h_CreatePlaced, (void**)&o_CreatePlaced);
++            TraceF("x4r: dump mode for %zu kernels into %s\\dump", g_dumpWant.size(), g_dir.c_str());
++        }
 +        // ID3D12GraphicsCommandList vtable: 14 Dispatch, 25 SetPipelineState (shared by all lists, so one throwaway list is enough)
 +        ID3D12CommandAllocator* al = nullptr; ID3D12GraphicsCommandList* cl = nullptr;
 +        if (SUCCEEDED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator), (void**)&al)) &&
@@ -677,11 +1147,39 @@ index 0000000..6896073
 +            Patch(lv, 25, (void*)h_SetPSO, (void**)&o_SetPSO);
 +            Patch(lv, 14, (void*)h_Dispatch, (void**)&o_Dispatch);
 +            Patch(lv, 9, (void*)h_Close, (void**)&o_Close);
++            Patch(lv, 10, (void*)h_Reset, (void**)&o_Reset);
++            Patch(lv, 11, (void*)h_ClearState, (void**)&o_ClearState);
++            if (g_dumpOn)
++            {
++                // 29 SetComputeRootSignature, 31 SetComputeRootDescriptorTable, 33/35 SetComputeRoot32BitConstant(s), 37/39/41 root CBV/SRV/UAV
++                Patch(lv, 29, (void*)h_SetRS, (void**)&o_SetRS);
++                Patch(lv, 15, (void*)h_CopyBuf, (void**)&o_CopyBuf);   // CopyBufferRegion
++                Patch(lv, 17, (void*)h_CopyRes, (void**)&o_CopyRes);   // CopyResource
++                Patch(lv, 31, (void*)h_SetTable, (void**)&o_SetTable);
++                Patch(lv, 33, (void*)h_SetConst, (void**)&o_SetConst);
++                Patch(lv, 35, (void*)h_SetConsts, (void**)&o_SetConsts);
++                Patch(lv, 37, (void*)h_SetRootCbv, (void**)&o_SetRootCbv);
++                Patch(lv, 39, (void*)h_SetRootSrv, (void**)&o_SetRootSrv);
++                Patch(lv, 41, (void*)h_SetRootUav, (void**)&o_SetRootUav);
++            }
 +            if (!g_timingInit) InitTiming(dev);
 +            o_Close(cl);
 +        }
 +        if (cl) cl->Release();
 +        if (al) al->Release();
++        g_frameSyncRequested = IniValue("FrameSync") == "true" || GetEnvironmentVariableA("X4R_FRAME_SYNC", nullptr, 0) > 0;
++        g_frameSync = g_frameSyncRequested;
++        if (g_frameSync) {
++            ID3D12CommandQueue* q = nullptr; D3D12_COMMAND_QUEUE_DESC desc = {}; desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
++            if (SUCCEEDED(dev->CreateCommandQueue(&desc, __uuidof(ID3D12CommandQueue), (void**)&q))) {
++                void** qv = *(void***)q;
++                Patch(qv, 10, (void*)h_ExecuteLists, (void**)&o_ExecuteLists);
++                Patch(qv, 15, (void*)h_QueueWait, (void**)&o_QueueWait);
++                if (!o_ExecuteLists || !o_QueueWait || qv[10] != (void*)h_ExecuteLists || qv[15] != (void*)h_QueueWait) g_frameSync = false;
++                q->Release(); TraceF("x4r: frame-sync trial enabled");
++            } else { g_frameSync = false; TraceF("x4r: frame-sync queue hook unavailable"); }
++        }
++        WriteFrameSyncReport(nullptr, 0, nullptr);
 +        TraceF("x4r: device %p hooked", dev);
 +    });
 +}

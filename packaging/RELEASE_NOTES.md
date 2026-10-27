@@ -14,8 +14,8 @@ On first launch the bundled plugin copies its shim into the game's Proton prefix
 ## What's in it
 
 - OptiScaler 0.9.4 (`dxgi.dll`, GPL-3.0, unmodified) preconfigured for XeSS, plus Intel's XeSS 2.0.2.68 `libxess.dll` (unmodified, Intel Simplified Software License included).
-- x4r plugin (`x4r/x4r.asi`) with 44 translated XeSS kernels, covering the pipelines OptiScaler's XeSS setup requests in Ghost of Tsushima (network model KPSS, LDR color, exposure texture, inverted depth, low-resolution motion vectors).
-- Kernel sets for **RDNA3 (gfx11)** and **RDNA4 (gfx12)**, 21 WMMA/mixed-dot overrides each, chosen automatically from the GPU; other AMD GPUs use the stock dot4 kernels. `x4r/x4r.ini` can force a set (`Profile`), or run XeSS's own DP4a path under the same setup for comparison (`Backend = dp4a`).
+- x4r plugin (`x4r/x4r.asi`) with 130 translated XeSS kernels. Covers kernel requests captured from 96 combinations of color mode, exposure, motion-vector resolution, jitter and responsive masks. Includes Ready or Not's HDR/automatic-exposure and responsive-mask variants (previously missing `d09865d3c47fe34c` and then `66fbdd75308e78e4`). This compatibility fix is not a demonstrated ghosting fix.
+- Kernel sets for **RDNA3 (gfx11)** and **RDNA4 (gfx12)**, 23 WMMA/mixed-dot overrides each, chosen automatically from the GPU; other translated kernels use stock dot4. `x4r/x4r.ini` can force a set (`Profile`), or run XeSS's own DP4a path under the same setup for comparison (`Backend = dp4a`).
 - **No silent fallback:** if the XeSS in use is not 2.0.2.68 or a kernel cannot be built, XeSS pipeline creation fails and `x4r-check.sh` reports FAIL instead of quietly using DP4a or rendering noise.
 - Proof of use: `x4r/status.txt` records GPU, kernel set, translated/WMMA/failed kernel counts, dispatch count and XeSS GPU time. `Trace = true` in `x4r.ini` adds per-kernel GPU times.
 
@@ -31,6 +31,7 @@ Offline, the WMMA set, the RDNA4 set and the stock kernels give identical output
 
 ## Limits
 
+- Severe ghosting remains unresolved with both translated DXIL and WMMA, through native XeSS and FSR inputs. See `docs/GHOSTING_AUDIT.md`; this build is not a confirmed quality fix.
 - Kernels are for XeSS **2.0.2.68** only, and for the settings OptiScaler's default setup requests; other XeSS settings may need kernels that are not translated yet (XeSS then fails visibly). `Capture = true` in `x4r.ini` records the missing ones.
 - Tested on one GPU (RX 7700 XT) with synthetic fixtures and Ghost of Tsushima. **The RDNA4 set has not run on RDNA4 hardware**; other RDNA3 GPUs and other games are untested. Please report results.
 - dyn_32's float reciprocal differs from the CPU oracle by 1 ulp; dyn_24 runs on the stock path because its WMMA build disagrees with the oracle.

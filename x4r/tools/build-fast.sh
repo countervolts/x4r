@@ -11,7 +11,7 @@ free -m
 # family diverged from the DXIL under non-zero motion vectors, 26.1 dB vs 31.0 dB in quality-motion.py)
 x4r_fast_profile 2 dxil
 bash "$R/x4r/tools/build-kernel.sh" 2
-X4R_RDNA=3 X4R_PROFILE=fast bash "$R/x4r/tools/build-wmma.sh" 2 32 34 38 40 42 43 12 7 25 27 28 26 29 13 18 23 33 35 39 41
+X4R_RDNA=3 X4R_PROFILE=fast bash "$R/x4r/tools/build-wmma.sh" 2 32 34 38 40 42 43 12 7 25 27 28 26 29 13 18 23 33 35 39 41 47 103
 if [[ ${X4R_SKIP_RDNA4:-0} != 1 ]]; then
-  X4R_RDNA=4 X4R_OVR_DIR="$R/prefix/drive_c/x4r/ovr-rdna4" X4R_PROFILE=fast bash "$R/x4r/tools/build-wmma.sh" 2 32 34 38 40 42 43 12 7 25 27 28 26 29 13 18 23 33 35 39 41
+  X4R_RDNA=4 X4R_OVR_DIR="$R/prefix/drive_c/x4r/ovr-rdna4" X4R_PROFILE=fast bash "$R/x4r/tools/build-wmma.sh" 2 32 34 38 40 42 43 12 7 25 27 28 26 29 13 18 23 33 35 39 41 47 103
 fi
