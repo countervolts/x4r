@@ -8,7 +8,8 @@ on RDNA's WMMA units. No Intel hardware is involved.
 Install
 -------
 1. Extract everything in this zip into the folder that holds the game's main .exe (Unreal Engine:
-   <game>/<Project>/Binaries/Win64). You get dxgi.dll, OptiScaler.ini, libxess.dll, Licenses/ and an x4r folder.
+   <game>/<Project>/Binaries/Win64). You get dxgi.dll, OptiScaler.ini, Licenses/, an OptiScaler folder
+   (OptiScaler's own XeSS 2.0.2.68 and FSR files; the game's files are not replaced) and an x4r folder.
    If the folder already has a dxgi.dll or OptiScaler.ini (another OptiScaler install), move those out of the way
    first, and remove PROTON_USE_OPTISCALER from the game's launch options.
 2. Use GE-Proton 11 for the game. No launch options are needed.
@@ -31,8 +32,8 @@ Limits
   previous build missed the latter and still fell back to FSR. Kernel coverage was checked across 96 settings
   combinations; the matching responsive-mask setup renders successfully. Fully restart the game after updating:
   changing the upscaler within the existing process does not clear a cached missing-kernel failure.
-* The kernels are for XeSS 2.0.2.68, the libxess.dll in this zip. If the game's own XeSS or another libxess.dll is used
-  instead, XeSS fails rather than silently using DP4a (x4r-check.sh prints FAIL).
+* The kernels are for XeSS 2.0.2.68, the OptiScaler/libxess.dll in this zip. If another libxess.dll is used
+  instead (e.g. XeSSPath changed in OptiScaler.ini), XeSS fails rather than silently using DP4a (x4r-check.sh prints FAIL).
 * Severe ghosting is unresolved on the RX 7700 XT, including with Profile = dxil. This build is not a ghosting fix.
   To compare with Intel's unmodified DP4a implementation, change Backend = dp4a in x4r/x4r.ini and restart the game.
   Change it back to Backend = x4r to use the translated XMX path. See X4R_GHOSTING_AUDIT.md in this archive.
@@ -42,10 +43,10 @@ Limits
 * Research prototype, not affiliated with Intel, AMD or the OptiScaler project. Set IGDEXT_TRACE=1 in the launch options
   to get C:\igdext_trace.log inside the prefix; x4r/installation-status.txt reports the first-launch setup.
 
-Uninstall: bash x4r/uninstall.sh, then delete dxgi.dll, OptiScaler.ini, libxess.dll, x4r and Licenses from
+Uninstall: bash x4r/uninstall.sh, then delete dxgi.dll, OptiScaler.ini, the OptiScaler and x4r folders and Licenses from
 the game folder.
 
-Licences: x4r is GPL-3.0-only. OptiScaler (dxgi.dll) is GPL-3.0; libxess.dll is Intel's XeSS SDK under the Intel Simplified
+Licences: x4r is GPL-3.0-only. OptiScaler (dxgi.dll, OptiScaler/) is GPL-3.0 (bundled AMD/Microsoft files under Licenses/); OptiScaler/libxess.dll is Intel's XeSS SDK under the Intel Simplified
 Software License (Licenses/XeSS_LICENSE.txt), redistributed unmodified. The shim derives from xess-xmx-linux and
 dxvk-igdext (MIT, x4r/licenses). The translated kernels derive from XeSS and are not covered by x4r's licence.
 Source: x4r/source and https://github.com/countervolts/x4r

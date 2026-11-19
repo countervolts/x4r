@@ -4,7 +4,7 @@ First release: Intel XeSS's XMX network running on AMD RDNA3 and RDNA4 under Lin
 
 ## Install
 
-1. Extract `x4r-0.1.0.zip` into the folder with the game's main `.exe` (Unreal Engine: `<Game>/Binaries/Win64`). If the folder already has a `dxgi.dll`, `OptiScaler.ini` or `libxess.dll`, move them away first; the zip's `libxess.dll` (XeSS 2.0.2.68) replaces the game's.
+1. Extract `x4r-0.1.0.zip` into the folder with the game's main `.exe` (Unreal Engine: `<Game>/Binaries/Win64`). If the folder already has a `dxgi.dll` or `OptiScaler.ini` (another OptiScaler install), move them away first. The game's own files are not replaced.
 2. Use GE-Proton 11 for the game. No launch options, no installer to run.
 3. Start the game and pick FSR 3.1 (or DLSS) in its graphics settings. OptiScaler replaces it with XeSS.
 4. Optional check after playing a few seconds: `bash x4r/x4r-check.sh`. **PASS** means the translated XMX kernels were dispatched.
@@ -13,7 +13,7 @@ On first launch the bundled plugin copies its shim into the game's Proton prefix
 
 ## What's in it
 
-- OptiScaler 0.9.4 (`dxgi.dll`, GPL-3.0, unmodified) preconfigured for XeSS, plus Intel's XeSS 2.0.2.68 `libxess.dll` (unmodified, Intel Simplified Software License included).
+- OptiScaler nightly `v10.0.0-pre1_20261119_4a8d55a9` (`dxgi.dll` plus its `OptiScaler/` folder, GPL-3.0, unmodified) preconfigured for XeSS. It brings Intel's XeSS 2.0.2.68 as `OptiScaler/libxess.dll` (unmodified, Intel Simplified Software License included). OptiScaler v10 is a pre-release.
 - x4r plugin (`x4r/x4r.asi`) with 130 translated XeSS kernels. Covers kernel requests captured from 96 combinations of color mode, exposure, motion-vector resolution, jitter and responsive masks. Includes Ready or Not's HDR/automatic-exposure and responsive-mask variants (previously missing `d09865d3c47fe34c` and then `66fbdd75308e78e4`). This compatibility fix is not a demonstrated ghosting fix.
 - Kernel sets for **RDNA3 (gfx11)** and **RDNA4 (gfx12)**, 23 WMMA/mixed-dot overrides each, chosen automatically from the GPU; other translated kernels use stock dot4. `x4r/x4r.ini` can force a set (`Profile`), or run XeSS's own DP4a path under the same setup for comparison (`Backend = dp4a`).
 - **No silent fallback:** if the XeSS in use is not 2.0.2.68 or a kernel cannot be built, XeSS pipeline creation fails and `x4r-check.sh` reports FAIL instead of quietly using DP4a or rendering noise.
@@ -31,6 +31,7 @@ Offline, the WMMA set, the RDNA4 set and the stock kernels give identical output
 
 ## Limits
 
+- This package uses an OptiScaler v10 nightly. Its XeSS (2.0.2.68) is byte-identical to the one the kernels were made from, but the measurements below were taken with OptiScaler 0.9.4; the nightly has not been run in game yet.
 - Severe ghosting remains unresolved with both translated DXIL and WMMA, through native XeSS and FSR inputs. See `docs/GHOSTING_AUDIT.md`; this build is not a confirmed quality fix.
 - Kernels are for XeSS **2.0.2.68** only, and for the settings OptiScaler's default setup requests; other XeSS settings may need kernels that are not translated yet (XeSS then fails visibly). `Capture = true` in `x4r.ini` records the missing ones.
 - Tested on one GPU (RX 7700 XT) with synthetic fixtures and Ghost of Tsushima. **The RDNA4 set has not run on RDNA4 hardware**; other RDNA3 GPUs and other games are untested. Please report results.

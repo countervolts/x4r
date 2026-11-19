@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-only
 # Undo what x4r did outside the game folder:  bash x4r/uninstall.sh [--prefix DIR]
-# Afterwards delete dxgi.dll, OptiScaler.ini, libxess.dll, the x4r folder and Licenses from the game folder.
+# Afterwards delete dxgi.dll, OptiScaler.ini, the OptiScaler and x4r folders and Licenses from the game folder.
 set -euo pipefail
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 GAME=$(dirname -- "$HERE")

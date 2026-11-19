@@ -94,7 +94,7 @@ At run time the shim (`X4r.cpp`) reads the GPU name Wine takes from RADV
 (`HKLM\...\Enum\PCI`), sets `VKD3D_SHADER_OVERRIDE` to the matching set before
 the first kernel is built, and writes `x4r/status.txt`.
 `x4r/tools/package-release.sh` (needs `X4R_REDISTRIBUTE_KERNELS=1`, see
-THIRD_PARTY.md, and `X4R_OPTISCALER=<OptiScaler 0.9.x archive>`) stages the
+THIRD_PARTY.md, and `X4R_OPTISCALER=<OptiScaler v10 nightly or 0.9.x archive>`) stages the
 OptiScaler bundle, `x4r.asi` (the same DLL as the shim; loaded as a
 plugin it installs itself into the prefix) and `x4r/` into
 `dist/x4r-<version>.zip`.

@@ -41,8 +41,8 @@ XMX-path network running through translation, with no Intel XMX hardware present
 Drag and drop, OptiScaler style:
 
 1. Extract the release zip into the folder holding the game's main `.exe`
-   (it brings OptiScaler as `dxgi.dll`, XeSS 2.0.2.68 as `libxess.dll` and a
-   `x4r/` folder). Use GE-Proton 11; no launch options.
+   (it brings OptiScaler as `dxgi.dll`, its `OptiScaler/` folder with XeSS
+   2.0.2.68, and a `x4r/` folder). Use GE-Proton 11; no launch options.
 2. Start the game and pick FSR 3.1 (or DLSS) in its graphics settings.
    OptiScaler replaces it with XeSS. The first launch sets x4r up by itself
    (shim into the Proton prefix, Intel vendor id in the game's `dxvk.conf`).
