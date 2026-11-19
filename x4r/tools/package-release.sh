@@ -60,8 +60,6 @@ cp -r "$RT/ovr-rdna4" "$X/ovr-rdna4"
 cp "$RT/splitz.txt" "$X/"
 cp "$R/packaging/"{x4r.ini,x4r-check.sh,uninstall.sh,VERSION} "$X/"
 cp "$R/packaging/README.txt" "$STAGE/X4R_README.txt"
-cp "$R/docs/GHOSTING_AUDIT.md" "$STAGE/X4R_GHOSTING_AUDIT.md"
-cp "$R/docs/FRAME_SYNC_TRIAL.md" "$STAGE/X4R_FRAME_SYNC_TRIAL.md"
 chmod +x "$X/"*.sh
 cp "$R/LICENSE" "$X/licenses/x4r-LICENSE-GPL-3.0.txt"
 cp "$R/LICENSES/"* "$X/licenses/"

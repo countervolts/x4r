@@ -36,7 +36,7 @@ Limits
   instead (e.g. XeSSPath changed in OptiScaler.ini), XeSS fails rather than silently using DP4a (x4r-check.sh prints FAIL).
 * Severe ghosting is unresolved on the RX 7700 XT, including with Profile = dxil. This build is not a ghosting fix.
   To compare with Intel's unmodified DP4a implementation, change Backend = dp4a in x4r/x4r.ini and restart the game.
-  Change it back to Backend = x4r to use the translated XMX path. See X4R_GHOSTING_AUDIT.md in this archive.
+  Change it back to Backend = x4r to use the translated XMX path. See x4r/source/docs/GHOSTING_AUDIT.md.
 * Tested locally: Radeon RX 7700 XT (gfx1101), synthetic fixtures and Ghost of Tsushima. Other games, other GPUs and
   the RDNA4 kernel set on RDNA4 hardware are not validated. This is not a universal installer. DX12 / Proton only;
   frame generation is not translated. Different XeSS flags or network models can require additional kernels.
