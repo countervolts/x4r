@@ -5,13 +5,39 @@
 usage: build_hip.py --gpu gfx1101 --out <dir> [--llvm <clang dir>] [--wmma] [--ids 2,7,29] [--jobs N] [--stats]
 env: X4R_PRIVATE (default <repo>/private: kernels/, runtime/rs/), X4R_BUILD (x4r/build-win: x4rwave.exe)
 --wmma: x4rwave's WMMA flavour (X4R_WMMA=1) for the kernels that have one (RDNA3 / RDNA4 only)
---stats: print each kernel's VGPRs, scratch and occupancy (clang's resource-usage remarks)"""
+--stats: print each kernel's VGPRs, scratch and occupancy (clang's resource-usage remarks)
+--fast: x4rwave's per-kernel settings of tools/fast-profile.sh (the Linux fast build), for the kernels that have one"""
 import argparse, concurrent.futures as cf, os, re, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 import hlsl2hip  # noqa: E402
+
+FAST_KEYS = ['X4R_WORD_GATHER', 'X4R_EFORM_MIN', 'X4R_FWD_DEPTH', 'X4R_NATIVE_MIXED_DOT', 'X4R_PACK_EARLY', 'X4R_WMMA_SINGLE',
+             'X4R_WMMA_REGC', 'X4R_WMMA_REGA', 'X4R_WMMA_REGB', 'X4R_WMMA_SCATTERA', 'X4R_WMMA_ASTRIDE', 'X4R_WMMA_BSTRIDE',
+             'X4R_REG_ROUTE', 'X4R_SIMPLE_SHUFFLES', 'X4R_BITCAST_FWD', 'X4R_FWD', 'X4R_WMMA_CACHE']
+
+
+def fast_profile(i, gpu):
+    """tools/fast-profile.sh as a dict (None: no validated profile for this kernel)"""
+    i = int(i)
+    e = {'X4R_SIMPLE_SHUFFLES': '1', 'X4R_BITCAST_FWD': '1', 'X4R_FWD': '3', 'X4R_WMMA_CACHE': '6'}
+    if i in (2, 32, 34, 38, 40, 42, 43):
+        e.update(X4R_WORD_GATHER='1', X4R_EFORM_MIN='5', X4R_FWD_DEPTH='128')
+    elif i in (29, 33, 35, 39, 41, 47, 103):
+        e.update(X4R_WMMA_SCATTERA='1', X4R_WMMA_SINGLE='1', X4R_WMMA_CACHE='9')
+    elif i == 7:
+        e.update(X4R_WMMA_SCATTERA='1')
+    elif i == 26:
+        e.update(X4R_WMMA_SCATTERA='1', X4R_PACK_EARLY='1', X4R_WMMA_CACHE='9')
+    elif i in (12, 13, 18, 23, 25, 27, 28):
+        e.update(X4R_PACK_EARLY='1')
+    else:
+        return None
+    if i in (7, 26, 29, 33, 35, 39, 41, 47, 103):
+        e.update(X4R_WMMA_ASTRIDE='12', X4R_WMMA_BSTRIDE='12')
+    return e
 
 
 def one(i, kh, a, priv, build, work):
@@ -24,6 +50,10 @@ def one(i, kh, a, priv, build, work):
     env = dict(os.environ)
     if a.wmma: env['X4R_WMMA'] = '1'
     else: env.pop('X4R_WMMA', None)
+    for k in FAST_KEYS: env.pop(k, None)
+    if a.fast:
+        fp = fast_profile(i, a.gpu)
+        if fp: env.update(fp)
     r = subprocess.run([os.path.join(build, 'x4rwave.exe'), ll, rs, *lws, hl], env=env, capture_output=True, text=True)
     if r.returncode: return i, kh, 'x4rwave failed: ' + (r.stderr or r.stdout)[-300:]
     open(hip, 'w', newline='\n').write(hlsl2hip.convert(open(hl).read()))
@@ -45,7 +75,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--gpu', required=True); ap.add_argument('--out', required=True); ap.add_argument('--llvm')
     ap.add_argument('--wmma', action='store_true'); ap.add_argument('--ids'); ap.add_argument('--jobs', type=int, default=os.cpu_count())
-    ap.add_argument('--stats', action='store_true')
+    ap.add_argument('--stats', action='store_true'); ap.add_argument('--fast', action='store_true')
     a = ap.parse_args()
     priv = os.environ.get('X4R_PRIVATE', os.path.join(REPO, 'private'))
     build = os.environ.get('X4R_BUILD', os.path.join(REPO, 'x4r', 'build-win'))

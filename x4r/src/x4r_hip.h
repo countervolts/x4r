@@ -85,6 +85,15 @@ X4R_FN float cos(float x) { return __builtin_amdgcn_cosf(x * 0.15915494309189535
 // Waves are 32 lanes; a CM thread is 16 of them (x4rwave)
 X4R_FN uint WaveGetLaneIndex() { return __builtin_amdgcn_mbcnt_lo(~0u, 0u); }
 X4R_FN uint WaveReadLaneAt(uint x, uint lane) { return uint(__builtin_amdgcn_ds_bpermute(int(lane << 2), int(x))); }
+// lane i of each group of 4 (DPP quad_perm; i is a literal in x4rwave's output, so the switch folds)
+X4R_FN uint QuadReadLaneAt(uint x, uint i) {
+    switch (i & 3u) {
+    case 0: return uint(__builtin_amdgcn_mov_dpp(int(x), 0x00, 0xf, 0xf, false));
+    case 1: return uint(__builtin_amdgcn_mov_dpp(int(x), 0x55, 0xf, 0xf, false));
+    case 2: return uint(__builtin_amdgcn_mov_dpp(int(x), 0xaa, 0xf, 0xf, false));
+    default: return uint(__builtin_amdgcn_mov_dpp(int(x), 0xff, 0xf, 0xf, false));
+    }
+}
 X4R_FN void GroupMemoryBarrierWithGroupSync() {
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup");
     __builtin_amdgcn_s_barrier();

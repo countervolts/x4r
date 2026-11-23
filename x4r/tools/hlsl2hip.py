@@ -81,8 +81,9 @@ def build(hip, gpu, hsaco, llvm=None, extra=()):
         return name
     # device-only, unbundled: clang links the code object itself
     return subprocess.run([tool('clang'), '-x', 'hip', '--cuda-device-only', '--no-gpu-bundle-output', f'--offload-arch={gpu}', '-nogpulib', '-nogpuinc',
-                    '-O3', '-std=c++17', '-ffp-contract=off', '-fgpu-flush-denormals-to-zero',   # fp32 denormals flushed, as CM and D3D12 do
-                    f'-I{os.path.dirname(PRELUDE)}', '-Wno-deprecated-builtins', *extra, '-c', hip, '-o', hsaco],
+                    '-O3', '-mcumode', '-std=c++17',   # CU mode: the kernels' workgroups are one or two waves
+                     '-ffp-contract=off', '-fgpu-flush-denormals-to-zero',   # fp32 denormals flushed, as CM and D3D12 do
+                    f'-I{os.path.dirname(PRELUDE)}', '-Wno-deprecated-builtins', *os.environ.get('X4R_HIP_CFLAGS', '').split(), *extra, '-c', hip, '-o', hsaco],
                    check=True, capture_output=bool(extra), text=True)
 
 
