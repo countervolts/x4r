@@ -208,3 +208,22 @@ X4R_FN X4RMatC cmMulAdd(X4RMatA a, X4RMatB b, X4RMatC c, uint operands) {
     return X4RMatC{__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a.v, true, b.v, c.v, false)};
 #endif
 }
+
+// HLSL's uint(...) / int(...) (hlsl2hip.py renames them): from float they saturate as D3D12 and CM do (NaN -> 0, out of range -> the
+// nearest representable value), which C++'s conversion leaves undefined; from integers they are plain conversions.
+X4R_FN uint x4r_uint(float x) { return !(x > 0.0f) ? 0u : x >= 4294967296.0f ? 0xffffffffu : uint(x); }
+X4R_FN uint x4r_uint(uint x) { return x; }
+X4R_FN uint x4r_uint(int x) { return uint(x); }
+X4R_FN uint x4r_uint(uint64_t x) { return uint(x); }
+X4R_FN uint x4r_uint(int64_t x) { return uint(x); }
+X4R_FN uint x4r_uint(bool x) { return x ? 1u : 0u; }
+X4R_FN uint x4r_uint(uint16_t x) { return x; }
+X4R_FN int x4r_int(float x) { return x != x ? 0 : x >= 2147483648.0f ? 0x7fffffff : x <= -2147483648.0f ? int(0x80000000u) : int(x); }
+X4R_FN int x4r_int(int x) { return x; }
+X4R_FN int x4r_int(uint x) { return int(x); }
+X4R_FN int x4r_int(uint64_t x) { return int(x); }
+X4R_FN int x4r_int(int64_t x) { return int(x); }
+X4R_FN int x4r_int(bool x) { return x ? 1 : 0; }
+// HLSL's 0.0 is a float literal, C++'s a double: such mixed expressions convert back to float first
+X4R_FN uint x4r_uint(double x) { return x4r_uint(float(x)); }
+X4R_FN int x4r_int(double x) { return x4r_int(float(x)); }

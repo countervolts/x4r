@@ -7,6 +7,7 @@ SV_GroupIndex, helper functions, constant tables, groupshared arrays), so this i
   main(...)                 -> extern "C" kernel x4r_main(X4rArgs a) with the group id and flat thread index made up front
   helpers / tables / slm    -> __device__ functions, constant tables, __shared__ arrays
   float4(...) and friends   -> X4R_V_float4(...) (clang has no multi-argument vector constructor)
+  uint(...), int(...)       -> x4r_uint / x4r_int (saturating from float, as D3D12 and CM)
   [branch] [loop] [unroll]  -> dropped
 usage: hlsl2hip.py in.hlsl out.hip            (writes the .hip; --build GPU OUT.hsaco also compiles it: clang from --llvm or PATH)
        hlsl2hip.py in.hlsl out.hip --build gfx1101 out.hsaco [--llvm <dir with clang>]"""
@@ -66,6 +67,7 @@ def convert(text):
             line = 'X4R_FN ' + line
         line = re.sub(r'\[(branch|loop|unroll|flatten|fastopt)\] ?', '', line)
         line = re.sub(r'\b(float|int|uint)([234])\(', r'X4R_V_\1\2(', line)
+        line = re.sub(r'(?<![\w.])(u?int)\(', r'x4r_\1(', line)   # saturating from float (x4r_hip.h)
         out.append(line)
     return f'#include "{os.path.basename(PRELUDE)}"\n' + '\n'.join(out) + '\n'
 

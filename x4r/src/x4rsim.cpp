@@ -255,7 +255,22 @@ struct Thread
             for (unsigned i = 0; i < n; ++i) { uint64_t x = getU(r, rt, i); if (bits < 64) x &= (1ull << bits) - 1; setU(r, rt, i, x); }
             return r;
         case Instruction::FPToUI: case Instruction::FPToSI:
-            for (unsigned i = 0; i < n; ++i) { float f = getF(A(0), AT(0), i); setU(r, rt, i, op == Instruction::FPToSI ? (uint64_t)(int64_t)f : (uint64_t)f); }
+            // out-of-range values saturate and NaN gives 0, as the hardware converts (Intel GPUs, D3D12, AMD's v_cvt); LLVM leaves
+            // them undefined and a host cast wraps or returns garbage
+            for (unsigned i = 0; i < n; ++i)
+            {
+                const float f = getF(A(0), AT(0), i);
+                const double lim = bits >= 64 ? 18446744073709551616.0 : double(1ull << bits);
+                uint64_t v;
+                if (f != f) v = 0;
+                else if (op == Instruction::FPToUI) v = !(f > 0.0f) ? 0 : double(f) >= lim ? (bits >= 64 ? ~0ull : (1ull << bits) - 1) : (uint64_t)f;
+                else
+                {
+                    const double hi = lim / 2;
+                    v = double(f) >= hi ? (uint64_t)(int64_t)(hi - 1) : double(f) <= -hi ? (uint64_t)(int64_t)(-hi) : (uint64_t)(int64_t)f;
+                }
+                setU(r, rt, i, v);
+            }
             return r;
         case Instruction::UIToFP: case Instruction::SIToFP:
             for (unsigned i = 0; i < n; ++i) { uint64_t a = getU(A(0), AT(0), i); setF(r, rt, i, op == Instruction::SIToFP ? (float)sext(a, bitsOf(AT(0))) : (float)a); }
