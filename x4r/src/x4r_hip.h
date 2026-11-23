@@ -105,8 +105,7 @@ X4R_FN void AllMemoryBarrier() { __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, "agent
 // signed int8 x int8 dot product with accumulate (the AMD instruction differs per generation; RDNA3/4: the mixed-sign one with both
 // operands declared signed)
 X4R_FN int dot4add_i8packed(uint a, uint b, int acc) {
-#if defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || defined(__gfx1033__) || defined(__gfx1034__) || \
-    defined(__gfx1035__) || defined(__gfx1036__)
+#if defined(__GFX10__)   // RDNA2 (gfx1030-gfx1036, gfx10-3-generic)
     return __builtin_amdgcn_sdot4(int(a), int(b), acc, false);
 #else
     return __builtin_amdgcn_sudot4(true, int(a), true, int(b), acc, false);
@@ -115,8 +114,7 @@ X4R_FN int dot4add_i8packed(uint a, uint b, int acc) {
 X4R_FN uint dot4add_u8packed(uint a, uint b, uint acc) { return __builtin_amdgcn_udot4(a, b, acc, false); }
 
 // DWORD 3 of a raw buffer descriptor: 32-bit format, out-of-range checks on the byte offset
-#if defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || defined(__gfx1033__) || defined(__gfx1034__) || \
-    defined(__gfx1035__) || defined(__gfx1036__)
+#if defined(__GFX10__)   // RDNA2 (gfx1030-gfx1036, gfx10-3-generic)
 #define X4R_BUF_DW3 0x31014000
 #else
 #define X4R_BUF_DW3 0x31004000
@@ -165,7 +163,7 @@ struct X4rRwTex {
 typedef int x4r_i8x4 __attribute__((ext_vector_type(4)));
 typedef int x4r_i8x2 __attribute__((ext_vector_type(2)));
 typedef int x4r_i32x8 __attribute__((ext_vector_type(8)));
-#if defined(__gfx1200__) || defined(__gfx1201__)
+#if defined(__GFX12__)   // RDNA4 (gfx1200, gfx1201, gfx12-generic)
 struct X4RMatA { x4r_i8x2 v; };
 struct X4RMatB { x4r_i8x2 v; };
 #else
@@ -175,7 +173,7 @@ struct X4RMatB { x4r_i8x4 v; };
 struct X4RMatC { x4r_i32x8 v; };
 X4R_FN uint x4r_lane() { return __builtin_amdgcn_mbcnt_lo(~0u, 0u); }
 // row (A) or column (B) l & 15 of a 16 x 16 int8 tile whose rows / columns are `stride` words apart
-#if defined(__gfx1200__) || defined(__gfx1201__)
+#if defined(__GFX12__)   // RDNA4 (gfx1200, gfx1201, gfx12-generic)
 X4R_FN x4r_i8x2 x4r_tile8(const uint* p, uint stride) {   // RDNA4: lanes 0-15 hold k 0-7, lanes 16-31 k 8-15
     const uint l = x4r_lane();
     const uint* q = p + (l & 15u) * stride + (l >> 4) * 2u;
@@ -191,7 +189,7 @@ X4R_FN X4RMatA cmLoadA(const uint& p, uint layout, uint stride) { (void)layout; 
 X4R_FN X4RMatB cmLoadB(const uint& p, uint layout, uint stride) { (void)layout; return X4RMatB{x4r_tile8(&p, stride)}; }
 // C/D: lane l holds column l & 15; RDNA3: element i is row 2i + l / 16, RDNA4: row i + 8 (l / 16)
 X4R_FN uint x4r_crow(uint i, uint l) {
-#if defined(__gfx1200__) || defined(__gfx1201__)
+#if defined(__GFX12__)   // RDNA4 (gfx1200, gfx1201, gfx12-generic)
     return i + 8u * (l >> 4);
 #else
     return 2u * i + (l >> 4);
@@ -211,7 +209,7 @@ X4R_FN void cmStoreC(uint& p, X4RMatC m, uint layout, uint stride) {
 }
 X4R_FN X4RMatC cmMulAdd(X4RMatA a, X4RMatB b, X4RMatC c, uint operands) {
     (void)operands;
-#if defined(__gfx1200__) || defined(__gfx1201__)
+#if defined(__GFX12__)   // RDNA4 (gfx1200, gfx1201, gfx12-generic)
     return X4RMatC{__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a.v, true, b.v, c.v, false)};
 #else
     return X4RMatC{__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a.v, true, b.v, c.v, false)};
