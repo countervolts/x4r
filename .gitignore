@@ -27,3 +27,4 @@ __pycache__/
 *.py[cod]
 .vscode/
 .DS_Store
+/x4r/build-win/
