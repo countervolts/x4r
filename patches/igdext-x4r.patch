@@ -1,16 +1,17 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 209483d..c18eff2 100644
+index 71ffacd..9d16b26 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -26,6 +26,7 @@ set(SOURCES
+@@ -26,6 +26,8 @@ set(SOURCES
      ${DLL_DIR}/XellHook.cpp
      ${DLL_DIR}/GpuInfo.cpp
      ${DLL_DIR}/XellDriver.cpp
 +    ${DLL_DIR}/X4r.cpp
++    ${DLL_DIR}/hip_dyn.cpp
      ${SRC_DIR}/Trace.cpp
      ${DLL_DIR}/IgdextApiDllInt.cpp
      ${DLL_DIR}/IgdextApiDllLegacy.cpp
-@@ -57,7 +58,7 @@ target_compile_definitions(igdext PRIVATE
+@@ -57,7 +59,7 @@ target_compile_definitions(igdext PRIVATE
      INTC_IGDEXT_D3D12
  )
  
@@ -20,7 +21,7 @@ index 209483d..c18eff2 100644
  set_target_properties(igdext PROPERTIES
      OUTPUT_NAME "igdext64"
 diff --git a/src/D3D12ExtensionContext.cpp b/src/D3D12ExtensionContext.cpp
-index 81537c5..761e4e1 100644
+index e5d306e..12073e7 100644
 --- a/src/D3D12ExtensionContext.cpp
 +++ b/src/D3D12ExtensionContext.cpp
 @@ -3,6 +3,7 @@
@@ -40,10 +41,21 @@ index 81537c5..761e4e1 100644
      return S_OK;
  }
 diff --git a/src/Trace.cpp b/src/Trace.cpp
-index 8ad64cc..2df7a7c 100644
+index 39c48de..7a20aa4 100644
 --- a/src/Trace.cpp
 +++ b/src/Trace.cpp
-@@ -59,21 +59,27 @@ bool DumpBlob(const char* name, const void* data, size_t size)
+@@ -18,7 +18,9 @@ void TraceF(const char* fmt, ...)
+     if (!TraceOn()) return;
+     std::lock_guard<std::mutex> g(g_lock);
+     FILE* f = nullptr;
+-    if (fopen_s(&f, "C:\\igdext_trace.log", "ab") != 0 || !f) return;
++    char path[MAX_PATH] = "C:\\igdext_trace.log";   // IGDEXT_TRACE_PATH: elsewhere (native Windows: C:\ is not writable)
++    GetEnvironmentVariableA("IGDEXT_TRACE_PATH", path, MAX_PATH);
++    if (fopen_s(&f, path, "ab") != 0 || !f) return;
+     SYSTEMTIME st; GetLocalTime(&st);
+     fprintf(f, "%02d:%02d:%02d.%03d [%lu] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, GetCurrentThreadId());
+     va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
+@@ -59,21 +61,27 @@ bool DumpBlob(const char* name, const void* data, size_t size)
  const char* SafeStr(const void* p, char* buf, size_t cap)
  {
      if (!p) { snprintf(buf, cap, "(null)"); return buf; }
@@ -78,10 +90,10 @@ index 8ad64cc..2df7a7c 100644
      }
      return TRUE;
 diff --git a/src/dll/D3D12Api.cpp b/src/dll/D3D12Api.cpp
-index 71520b4..755b046 100644
+index 93586a6..be4d39f 100644
 --- a/src/dll/D3D12Api.cpp
 +++ b/src/dll/D3D12Api.cpp
-@@ -80,6 +80,12 @@ static int DynKernelId(unsigned long long hash, const void* spv, size_t spvLen,
+@@ -80,6 +80,13 @@ static int DynKernelId(unsigned long long hash, const void* spv, size_t spvLen,
      LeaveCriticalSection(&g_dynCs);
      return id;
  }
@@ -91,15 +103,26 @@ index 71520b4..755b046 100644
 +extern "C" void X4rKernelFailed(unsigned long long kernelHash, const char* why);
 +extern "C" int X4rGate();
 +extern "C" void X4rNotePipeline(ID3D12PipelineState* pso, unsigned long long kernelHash);
++extern "C" bool X4rHipKernel(unsigned long long kernelHash);   // x4r HIP backend
  static ID3D12Device* DevOf(INTCExtensionContext* c) { return (c && c->m_pD3D12ExtensionContext) ? c->m_pD3D12ExtensionContext->m_pAppDevice.Get() : nullptr; }
  
  
-@@ -239,6 +245,23 @@ HRESULT _INTC_D3D12_CreateComputePipelineState(INTCExtensionContext* ctx, const
+@@ -239,6 +246,33 @@ HRESULT _INTC_D3D12_CreateComputePipelineState(INTCExtensionContext* ctx, const
              if (useStatic) for (const XessDummy& xd : kXessDummies)
                  if (xd.hash == h) { desc.CS.pShaderBytecode = xd.bytes; desc.CS.BytecodeLength = xd.size; TraceF("  kernel hash %016llx -> dummy id %d (workgroup %d,%d,5)", h, xd.id, 1 + xd.id % 16, 1 + xd.id / 16); known = true; break; }
  #endif
 +            TraceF("  x4r: kernel %016llx rootsig %016llx", h, X4rRootSigHash(d->pD3D12Desc->pRootSignature));
 +            if (GetEnvironmentVariableA("X4R_CAPTURE", nullptr, 0)) X4rCaptureNote(h, X4rRootSigHash(d->pD3D12Desc->pRootSignature));
++            if (!known && d->ShaderInputType == CM_SPIRV && X4rHipKernel(h))
++            {
++                // x4r HIP backend: a no-op pipeline with the kernel's root signature; the dispatch runs the code object on HIP
++                desc.CS.pShaderBytecode = kDummyCS; desc.CS.BytecodeLength = sizeof(kDummyCS);
++                HRESULT xhr = dev->CreateComputePipelineState(&desc, riid, pp);
++                TraceF("  -> x4r HIP kernel (placeholder pipeline) hr=0x%08x", (unsigned)xhr);
++                if (SUCCEEDED(xhr)) { DynKernelId(h, d->CS.pShaderBytecode, d->CS.BytecodeLength, opts); X4rNotePipeline((ID3D12PipelineState*)*pp, h); return xhr; }
++                X4rKernelFailed(h, "placeholder pipeline rejected");
++                return xhr;
++            }
 +            if (!known && d->ShaderInputType == CM_SPIRV && X4rKernelBytecode(h, &desc.CS))
 +            {
 +                // x4r: a translated kernel exists: run it for real
@@ -118,7 +141,7 @@ index 71520b4..755b046 100644
              if (!known && d->ShaderInputType == CM_SPIRV)
              {
                  const int dyn = DynKernelId(h, d->CS.pShaderBytecode, d->CS.BytecodeLength, opts);
-@@ -290,10 +313,12 @@ static bool CalledFromXeFG()
+@@ -290,10 +324,12 @@ static bool CalledFromXeFG()
  // If the file is not newer than this process, placeholders would not be replaced - the stock driver is in use (the
  // session check fell back, the variables are missing) or vkd3d-proton changed how placeholders reach the driver - and
  // XeSS must use its DP4a path instead of producing noise. IGDEXT_SKIP_SELFTEST=1 skips it.
@@ -132,7 +155,7 @@ index 71520b4..755b046 100644
      if (GetEnvironmentVariableA("IGDEXT_SKIP_SELFTEST", b, sizeof(b)) > 0 && atoi(b)) { result = 1; return true; }
      result = 0;
 diff --git a/src/dll/IgdextApiDll.cpp b/src/dll/IgdextApiDll.cpp
-index 52f2a49..ffab72e 100644
+index 592993a..de24eed 100644
 --- a/src/dll/IgdextApiDll.cpp
 +++ b/src/dll/IgdextApiDll.cpp
 @@ -126,6 +126,7 @@ HRESULT D3D11GetSupportedVersions2(
@@ -153,10 +176,10 @@ index 52f2a49..ffab72e 100644
          *pSupportedExtVersionsCount = NumSupportedVersions;
 diff --git a/src/dll/X4r.cpp b/src/dll/X4r.cpp
 new file mode 100644
-index 0000000..3352964
+index 0000000..fb059ae
 --- /dev/null
 +++ b/src/dll/X4r.cpp
-@@ -0,0 +1,1084 @@
+@@ -0,0 +1,1261 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +// x4r: AMD backend for XeSS' CM kernels.
 +//  * hooks the D3D12 device to record XeSS' root signatures and descriptor views (so translated kernels can declare
@@ -165,11 +188,19 @@ index 0000000..3352964
 +//    Linux side), returns it so the real kernel runs instead of the placeholder.
 +#include "Stdafx.h"
 +#include "Trace.h"
++#include <dxgi1_6.h>
++#include <intrin.h>
++#include <psapi.h>
++#include <d3dcompiler.h>
++#include "hip_dyn.h"
++#include "d4r_d3d12_split.h"
 +#include <atomic>
 +#include <map>
 +#include <mutex>
 +#include <string>
 +#include <vector>
++
++extern "C" void X4rKernelFailed(unsigned long long kernelHash, const char* why);
 +
 +namespace
 +{
@@ -277,18 +308,25 @@ index 0000000..3352964
 +
 +// ---- X4R_DUMP=<kernel hash>:<n>[,<hash>:<n>...] (debug): copy every resource bound to the n-th dispatch (0-based) of a
 +// translated kernel, before ("pre") and after ("post") it runs, into <dir>\dump, to check kernels on real data ----
-+struct ViewRec { int kind = 0; ID3D12Resource* res = nullptr; DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN; UINT64 va = 0, size = 0; };   // kind 1 SRV, 2 UAV, 3 CBV
++struct ViewRec { int kind = 0; ID3D12Resource* res = nullptr; DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN; UINT64 va = 0, size = 0;   // kind 1 SRV, 2 UAV, 3 CBV
++                 bool buffer = false; UINT64 first = 0; UINT num = 0, stride = 0; };                                         // buffer views: elements, stride in bytes
 +struct HeapRec { SIZE_T cpu; UINT64 gpu; UINT n; };
 +struct RangeRec { int type; UINT base, count, offset; };      // type: D3D12_DESCRIPTOR_RANGE_TYPE
 +struct ParamRec { int type; UINT reg = 0, n = 0; std::vector<RangeRec> ranges; };   // type: D3D12_ROOT_PARAMETER_TYPE
++struct SampRec { UINT reg, filter, u, v, w; };                 // static sampler
 +struct ListBind { unsigned long long rs = 0; std::map<UINT, UINT64> tables, rootVa; std::map<UINT, std::vector<UINT>> consts; };
 +struct Pending { std::string name; ID3D12Resource* rb; UINT64 bytes; };
 +bool g_dumpOn = false;
++// HIP backend (native Windows: x4r.ini "Backend = hip" or X4R_BACKEND=hip): CM kernels with <dir>\hip\<hash>.hsaco get a placeholder
++// pipeline and run on AMD's HIP runtime at dispatch (x4r/tools/hlsl2hip.py builds the code objects); bindings are tracked as in dump mode
++bool g_hip = false;
++bool Tracking() { return g_dumpOn || g_hip; }
 +ID3D12Device* g_dev = nullptr;
 +UINT g_inc = 0;
 +std::map<SIZE_T, ViewRec> g_views;
 +std::vector<HeapRec> g_heaps;
 +std::map<unsigned long long, std::vector<ParamRec>> g_rsParams;
++std::map<unsigned long long, std::vector<SampRec>> g_rsSamp;
 +std::map<ID3D12RootSignature*, unsigned long long> g_rsObj;
 +std::map<UINT64, std::pair<UINT64, ID3D12Resource*>> g_bufs;   // GPU VA -> (size, buffer)
 +std::map<void*, ListBind> g_bind;
@@ -322,7 +360,13 @@ index 0000000..3352964
 +            else r.reg = p.Descriptor.ShaderRegister;
 +            ps.push_back(r);
 +        }
-+        std::lock_guard<std::mutex> l(g_mx); g_rsParams[h] = ps;
++        std::vector<SampRec> ss;
++        for (UINT i = 0; i < vd->Desc_1_1.NumStaticSamplers; ++i)
++        {
++            const D3D12_STATIC_SAMPLER_DESC& d = vd->Desc_1_1.pStaticSamplers[i];
++            ss.push_back({d.ShaderRegister, (UINT)d.Filter, (UINT)d.AddressU, (UINT)d.AddressV, (UINT)d.AddressW});
++        }
++        std::lock_guard<std::mutex> l(g_mx); g_rsParams[h] = ps; g_rsSamp[h] = ss;
 +    }
 +    des->Release();
 +}
@@ -396,6 +440,7 @@ index 0000000..3352964
 +    des->Release();
 +}
 +
++void HipNoteView(ID3D12Resource* r, DXGI_FORMAT f, bool uav, void* ret);
 +using PFN_CreateRootSignature = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, const void*, SIZE_T, REFIID, void**);
 +using PFN_CreateSRV = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_SHADER_RESOURCE_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
 +using PFN_CreateUAV = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, ID3D12Resource*, const D3D12_UNORDERED_ACCESS_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
@@ -411,7 +456,7 @@ index 0000000..3352964
 +        const unsigned long long h = Fnv(blob, size);
 +        { std::lock_guard<std::mutex> l(g_mx); g_rsHash[(ID3D12RootSignature*)*pp] = h; }
 +        DescribeRootSignature(h, blob, size);
-+        if (g_dumpOn) ParseRootSignature(h, blob, size);
++        if (Tracking()) ParseRootSignature(h, blob, size);
 +        TraceF("x4r: CreateRootSignature -> %p hash %016llx (%zu bytes)", *pp, h, (size_t)size);
 +    }
 +    return hr;
@@ -427,7 +472,14 @@ index 0000000..3352964
 +        else
 +            TraceF("x4r: SRV dim %d fmt %d", (int)d->ViewDimension, (int)d->Format);
 +    }
-+    if (g_dumpOn) { ViewRec v; v.kind = 1; v.res = r; v.fmt = d ? d->Format : DXGI_FORMAT_UNKNOWN; std::lock_guard<std::mutex> l(g_mx); g_views[h.ptr] = v; }
++    if (Tracking())
++    {
++        ViewRec v; v.kind = 1; v.res = r; v.fmt = d ? d->Format : DXGI_FORMAT_UNKNOWN;
++        if (d && d->ViewDimension == D3D12_SRV_DIMENSION_BUFFER)
++        { v.buffer = true; v.first = d->Buffer.FirstElement; v.num = d->Buffer.NumElements; v.stride = d->Buffer.StructureByteStride ? d->Buffer.StructureByteStride : 4; }
++        { std::lock_guard<std::mutex> l(g_mx); g_views[h.ptr] = v; }
++        if (g_hip && !v.buffer) HipNoteView(r, v.fmt, false, _ReturnAddress());
++    }
 +    o_CreateSRV(dev, r, d, h);
 +}
 +
@@ -441,7 +493,14 @@ index 0000000..3352964
 +        else
 +            TraceF("x4r: UAV dim %d fmt %d", (int)d->ViewDimension, (int)d->Format);
 +    }
-+    if (g_dumpOn) { ViewRec v; v.kind = 2; v.res = r; v.fmt = d ? d->Format : DXGI_FORMAT_UNKNOWN; std::lock_guard<std::mutex> l(g_mx); g_views[h.ptr] = v; }
++    if (Tracking())
++    {
++        ViewRec v; v.kind = 2; v.res = r; v.fmt = d ? d->Format : DXGI_FORMAT_UNKNOWN;
++        if (d && d->ViewDimension == D3D12_UAV_DIMENSION_BUFFER)
++        { v.buffer = true; v.first = d->Buffer.FirstElement; v.num = d->Buffer.NumElements; v.stride = d->Buffer.StructureByteStride ? d->Buffer.StructureByteStride : 4; }
++        { std::lock_guard<std::mutex> l(g_mx); g_views[h.ptr] = v; }
++        if (g_hip && !v.buffer) HipNoteView(r, v.fmt, true, _ReturnAddress());
++    }
 +    o_CreateUAV(dev, r, c, d, h);
 +}
 +
@@ -459,7 +518,7 @@ index 0000000..3352964
 +        fprintf(f, "x4r=%s\nxess_library=%s\ngpu=%s\nrdna=%d\nprofile=%s\nkernel_set=%s\ntranslated_kernels=%u\nwmma_kernels=%u\n"
 +                   "failed_kernels=%u\ndispatches=%llu\nxess_gpu_ms_per_frame=%.3f\nresult=%s\n",
 +                kVersion, g_xessVer.c_str(), g_gpuDesc.empty() ? "unknown" : g_gpuDesc.c_str(), g_gen, g_profile.c_str(),
-+                g_ovrDir.empty() ? "stock-dxil" : g_ovrDir.c_str(), translated, wmma, failed, (unsigned long long)g_dispatches, xessMs, result);
++                g_hip ? "hip" : g_ovrDir.empty() ? "stock-dxil" : g_ovrDir.c_str(), translated, wmma, failed, (unsigned long long)g_dispatches, xessMs, result);
 +        WriteFrameSyncStatus(f);
 +        fclose(f);
 +    }
@@ -674,6 +733,8 @@ index 0000000..3352964
 +    sl.used = false; sl.resolved = false; sl.count = 0;
 +}
 +
++bool HipDispatch(ID3D12GraphicsCommandList* l, unsigned long long h, UINT x, UINT y, UINT z);
++bool HipCopy(ID3D12GraphicsCommandList* l, ID3D12Resource* d, UINT64 doff, ID3D12Resource* s, UINT64 soff, UINT64 n);
 +void STDMETHODCALLTYPE h_SetPSO(ID3D12GraphicsCommandList* l, ID3D12PipelineState* p)
 +{
 +    { std::lock_guard<std::mutex> g(g_mx); g_curPso[l] = p; }
@@ -735,6 +796,7 @@ index 0000000..3352964
 +    static std::map<unsigned long long, bool> skip = [] { std::map<unsigned long long, bool> m; char b[4096] = {};   // debug: X4R_SKIP=<hash>,... drops those dispatches
 +        if (GetEnvironmentVariableA("X4R_SKIP", b, sizeof b)) for (char* t = strtok(b, ","); t; t = strtok(nullptr, ",")) m[strtoull(t, nullptr, 16)] = true; return m; }();
 +    if (h && skip.count(h)) return;
++    if (h && g_hip && HipDispatch(l, h, x, y, z)) return;   // runs on HIP (or was dropped, logged): the placeholder pipeline never runs
 +    static const bool serialize = GetEnvironmentVariableA("X4R_SERIALIZE", nullptr, 0) > 0;   // debug: full UAV barrier before every translated dispatch
 +    if (h && serialize) { D3D12_RESOURCE_BARRIER ub = {}; ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; l->ResourceBarrier(1, &ub); }
 +    if (di >= 0) l->EndQuery(g_qheap, D3D12_QUERY_TYPE_TIMESTAMP, (slot * kMaxDisp + di) * 2);
@@ -791,9 +853,10 @@ index 0000000..3352964
 +PFN_CopyBuf o_CopyBuf; PFN_CopyRes o_CopyRes;
 +void STDMETHODCALLTYPE h_CopyBuf(ID3D12GraphicsCommandList* l, ID3D12Resource* d, UINT64 doff, ID3D12Resource* s, UINT64 soff, UINT64 n)
 +{
-+    long nz = -1;   // nonzero bytes in the source range when the source is CPU-visible (upload heap), read at record time
++    if (g_hip && HipCopy(l, d, doff, s, soff, n)) return;   // inside a HIP batch: the copy runs there
++    long nz = -1;   // nonzero bytes in the source range when the source is CPU-visible (upload heap), read at record time (dump mode)
 +    D3D12_HEAP_PROPERTIES hp = {}; D3D12_HEAP_FLAGS hf;
-+    if (s && SUCCEEDED(s->GetHeapProperties(&hp, &hf)) && hp.Type == D3D12_HEAP_TYPE_UPLOAD)
++    if (g_dumpOn && s && SUCCEEDED(s->GetHeapProperties(&hp, &hf)) && hp.Type == D3D12_HEAP_TYPE_UPLOAD)
 +    {
 +        void* m = nullptr; D3D12_RANGE r = {(SIZE_T)soff, (SIZE_T)(soff + n)};
 +        if (SUCCEEDED(s->Map(0, &r, &m)) && m) { nz = 0; for (UINT64 i = 0; i < n; ++i) nz += ((const unsigned char*)m)[soff + i] != 0; D3D12_RANGE e = {0, 0}; s->Unmap(0, &e); }
@@ -848,18 +911,50 @@ index 0000000..3352964
 +    ID3D12Resource* r = (ID3D12Resource*)*pp;
 +    std::lock_guard<std::mutex> l(g_mx); g_bufs[r->GetGPUVirtualAddress()] = {d->Width, r};
 +}
++void HipNoteResource(ID3D12Resource* r, const D3D12_RESOURCE_DESC* d, D3D12_HEAP_TYPE type, ID3D12Heap* heap, UINT64 off, bool xess, bool shared);
++void HipNoteHeap(ID3D12Heap* h, UINT64 size, bool shared);
++bool HipFromXess(void* ret);
 +HRESULT STDMETHODCALLTYPE h_CreateCommitted(ID3D12Device* dv, const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS f, const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_STATES s, const D3D12_CLEAR_VALUE* c, REFIID riid, void** pp)
 +{
-+    HRESULT hr = o_CreateCommitted(dv, hp, f, d, s, c, riid, pp);
++    const bool xess = g_hip && HipFromXess(_ReturnAddress());
++    // HIP backend: libxess' own DEFAULT buffers are shared so HIP can import them
++    const bool share = xess && hp && hp->Type == D3D12_HEAP_TYPE_DEFAULT && d->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && !(f & D3D12_HEAP_FLAG_SHARED);
++    HRESULT hr = o_CreateCommitted(dv, hp, share ? (f | D3D12_HEAP_FLAG_SHARED) : f, d, s, c, riid, pp);
++    bool shared = share && SUCCEEDED(hr);
++    if (share && FAILED(hr)) hr = o_CreateCommitted(dv, hp, f, d, s, c, riid, pp);
 +    if (SUCCEEDED(hr)) RecordBuffer(pp, d);
++    if (SUCCEEDED(hr) && g_hip && pp && *pp)
++        HipNoteResource((ID3D12Resource*)*pp, d, hp ? hp->Type : D3D12_HEAP_TYPE_DEFAULT, nullptr, 0, xess, shared || (f & D3D12_HEAP_FLAG_SHARED));
 +    if (SUCCEEDED(hr) && pp && *pp) TraceF("x4r: res %p committed heap %d dim %d %llux%u fmt %d state %x", *pp, hp ? (int)hp->Type : -1, (int)d->Dimension, (unsigned long long)d->Width, d->Height, (int)d->Format, (unsigned)s);
 +    return hr;
 +}
 +HRESULT STDMETHODCALLTYPE h_CreatePlaced(ID3D12Device* dv, ID3D12Heap* heap, UINT64 off, const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_STATES s, const D3D12_CLEAR_VALUE* c, REFIID riid, void** pp)
 +{
++    const bool xess = g_hip && HipFromXess(_ReturnAddress());
 +    HRESULT hr = o_CreatePlaced(dv, heap, off, d, s, c, riid, pp);
 +    if (SUCCEEDED(hr)) RecordBuffer(pp, d);
++    if (SUCCEEDED(hr) && g_hip && pp && *pp) HipNoteResource((ID3D12Resource*)*pp, d, heap->GetDesc().Properties.Type, heap, off, xess, false);
 +    if (SUCCEEDED(hr) && pp && *pp) TraceF("x4r: res %p placed heap %p off %llu dim %d %llux%u fmt %d state %x", *pp, (void*)heap, (unsigned long long)off, (int)d->Dimension, (unsigned long long)d->Width, d->Height, (int)d->Format, (unsigned)s);
++    return hr;
++}
++// ID3D12Device::CreateHeap (HIP backend): libxess' DEFAULT heaps become shared, so its placed buffers can be imported
++using PFN_CreateResHeap = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_HEAP_DESC*, REFIID, void**);
++PFN_CreateResHeap o_CreateResHeap;
++HRESULT STDMETHODCALLTYPE h_CreateResHeap(ID3D12Device* dv, const D3D12_HEAP_DESC* d, REFIID riid, void** pp)
++{
++    const bool xess = HipFromXess(_ReturnAddress());
++    D3D12_HEAP_DESC sd = *d;
++    const bool share = xess && d->Properties.Type == D3D12_HEAP_TYPE_DEFAULT && !(d->Flags & D3D12_HEAP_FLAG_SHARED) &&
++                       !(d->Flags & D3D12_HEAP_FLAG_DENY_BUFFERS);   // only heaps that can hold buffers: textures never reach HIP this way
++    if (share) sd.Flags |= D3D12_HEAP_FLAG_SHARED;
++    HRESULT hr = o_CreateResHeap(dv, &sd, riid, pp);
++    const bool shared = share && SUCCEEDED(hr);
++    if (share && FAILED(hr)) { TraceF("x4r: HIP: shared heap refused (0x%08x), flags %x", (unsigned)hr, (unsigned)d->Flags); hr = o_CreateResHeap(dv, d, riid, pp); }
++    if (SUCCEEDED(hr) && pp && *pp)
++    {
++        HipNoteHeap((ID3D12Heap*)*pp, d->SizeInBytes, shared || (d->Flags & D3D12_HEAP_FLAG_SHARED));
++        TraceF("x4r: heap %p %llu bytes type %d flags %x%s%s", *pp, (unsigned long long)d->SizeInBytes, (int)d->Properties.Type, (unsigned)d->Flags, xess ? " (libxess)" : "", shared ? " shared" : "");
++    }
 +    return hr;
 +}
 +void STDMETHODCALLTYPE h_SetRS(ID3D12GraphicsCommandList* l, ID3D12RootSignature* rs)
@@ -998,6 +1093,14 @@ index 0000000..3352964
 +    }
 +    ps.clear();
 +}
++
++#include "X4rHip.inc"
++void HipNoteView(ID3D12Resource* r, DXGI_FORMAT f, bool uav, void* ret) { xh::NoteView(r, f, uav, ret); }
++bool HipDispatch(ID3D12GraphicsCommandList* l, unsigned long long h, UINT x, UINT y, UINT z) { return xh::Dispatch(l, h, x, y, z); }
++bool HipCopy(ID3D12GraphicsCommandList* l, ID3D12Resource* d, UINT64 doff, ID3D12Resource* s, UINT64 soff, UINT64 n) { return xh::Copy(l, d, doff, s, soff, n); }
++void HipNoteResource(ID3D12Resource* r, const D3D12_RESOURCE_DESC* d, D3D12_HEAP_TYPE type, ID3D12Heap* heap, UINT64 off, bool xess, bool shared) { xh::NoteResource(r, d, type, heap, off, xess, shared); }
++void HipNoteHeap(ID3D12Heap* h, UINT64 size, bool shared) { xh::NoteHeap(h, size, shared); }
++bool HipFromXess(void* ret) { return xh::FromXess(ret); }
 +}
 +
 +bool SameFile(const std::string& a, const std::string& b)
@@ -1052,6 +1155,77 @@ index 0000000..3352964
 +    if (FILE* f = nullptr; fopen_s(&f, (g_dir + "\\installation-status.txt").c_str(), "wb") == 0 && f) { fprintf(f, "%s\n", note.c_str()); fclose(f); }
 +}
 +
++// ---- native Windows (not Wine): XeSS takes its XMX path only on an Intel adapter. No dxvk.conf there: the adapter's GetDesc*
++// methods report Intel's vendor id (and an Arc A770's device id) to calls made from libxess.dll, the rest of the game sees the
++// real GPU. XeSS finds this shim through INTC_ALT_DRIVER_EXTENSIONS_PATH (the folder with igdext64.dll, a copy of this DLL).
++bool UnderWine()
++{
++    HMODULE n = GetModuleHandleA("ntdll.dll");
++    return n && GetProcAddress(n, "wine_get_version");
++}
++
++namespace spoof
++{
++using Desc0 = HRESULT(STDMETHODCALLTYPE*)(IDXGIAdapter*, DXGI_ADAPTER_DESC*);
++using Desc1 = HRESULT(STDMETHODCALLTYPE*)(IDXGIAdapter1*, DXGI_ADAPTER_DESC1*);
++using Desc2 = HRESULT(STDMETHODCALLTYPE*)(IDXGIAdapter2*, DXGI_ADAPTER_DESC2*);
++using Desc3 = HRESULT(STDMETHODCALLTYPE*)(IDXGIAdapter4*, DXGI_ADAPTER_DESC3*);
++Desc0 g0 = nullptr; Desc1 g1 = nullptr; Desc2 g2 = nullptr; Desc3 g3 = nullptr;
++constexpr UINT kVendor = 0x8086, kDevice = 0xE20B;   // Intel Arc A770 (XMX)
++
++bool FromXess(void* ret)
++{
++    HMODULE m = nullptr;
++    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCSTR>(ret), &m)) return false;
++    char p[MAX_PATH] = {};
++    GetModuleFileNameA(m, p, MAX_PATH);
++    const char* b = strrchr(p, '\\');
++    return b && _stricmp(b + 1, "libxess.dll") == 0;
++}
++template <class D> void Patch(D* d, void* ret) { if (FromXess(ret)) { d->VendorId = kVendor; d->DeviceId = kDevice; } }
++HRESULT STDMETHODCALLTYPE GetDesc0(IDXGIAdapter* a, DXGI_ADAPTER_DESC* d) { HRESULT r = g0(a, d); if (SUCCEEDED(r)) Patch(d, _ReturnAddress()); return r; }
++HRESULT STDMETHODCALLTYPE GetDesc1(IDXGIAdapter1* a, DXGI_ADAPTER_DESC1* d) { HRESULT r = g1(a, d); if (SUCCEEDED(r)) Patch(d, _ReturnAddress()); return r; }
++HRESULT STDMETHODCALLTYPE GetDesc2(IDXGIAdapter2* a, DXGI_ADAPTER_DESC2* d) { HRESULT r = g2(a, d); if (SUCCEEDED(r)) Patch(d, _ReturnAddress()); return r; }
++HRESULT STDMETHODCALLTYPE GetDesc3(IDXGIAdapter4* a, DXGI_ADAPTER_DESC3* d) { HRESULT r = g3(a, d); if (SUCCEEDED(r)) Patch(d, _ReturnAddress()); return r; }
++
++template <class F> void Hook(void** vt, int slot, F fn, F& orig)
++{
++    if (vt[slot] == reinterpret_cast<void*>(fn)) return;
++    DWORD old;
++    if (!VirtualProtect(&vt[slot], sizeof(void*), PAGE_READWRITE, &old)) return;
++    orig = reinterpret_cast<F>(vt[slot]);
++    vt[slot] = reinterpret_cast<void*>(fn);
++    VirtualProtect(&vt[slot], sizeof(void*), old, &old);
++}
++
++// IDXGIAdapter vtable: GetDesc 8, GetDesc1 10 (IDXGIAdapter1), GetDesc2 11 (IDXGIAdapter2), GetDesc3 18 (IDXGIAdapter4)
++void Install()
++{
++    HMODULE dxgi = LoadLibraryA("dxgi.dll");
++    auto create = dxgi ? reinterpret_cast<HRESULT(WINAPI*)(REFIID, void**)>(GetProcAddress(dxgi, "CreateDXGIFactory1")) : nullptr;
++    IDXGIFactory1* f = nullptr;
++    if (!create || FAILED(create(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&f)))) { TraceF("x4r: no DXGI factory: vendor id not spoofed"); return; }
++    IDXGIAdapter1* a = nullptr;
++    for (UINT i = 0; f->EnumAdapters1(i, &a) == S_OK; ++i)
++    {
++        void** vt = *reinterpret_cast<void***>(a);
++        Hook(vt, 8, &GetDesc0, g0);
++        Hook(vt, 10, &GetDesc1, g1);
++        IDXGIAdapter4* a4 = nullptr;
++        if (SUCCEEDED(a->QueryInterface(__uuidof(IDXGIAdapter4), reinterpret_cast<void**>(&a4))))
++        {
++            void** vt4 = *reinterpret_cast<void***>(a4);
++            Hook(vt4, 11, &GetDesc2, g2);
++            Hook(vt4, 18, &GetDesc3, g3);
++            a4->Release();
++        }
++        a->Release();
++    }
++    f->Release();
++    TraceF("x4r: native Windows: XeSS sees vendor %04x device %04x", kVendor, kDevice);
++}
++} // namespace spoof
++
 +// DllMain: locate the runtime folder (<dll folder>\x4r, or X4R_DIR set by the plugin instance), falling back to C:\x4r.
 +// Returns true when this DLL was loaded as the x4r.asi plugin (it then only installs itself and stays idle).
 +extern "C" bool X4rInit(HMODULE self)
@@ -1065,7 +1239,7 @@ index 0000000..3352964
 +    if (!slash) return false;
 +    *slash = 0;
 +    std::string cand = std::string(p) + "\\x4r";
-+    if (DirExists(std::string(p) + "\\dxil")) cand = p;      // release layout: <game>\x4r\x4r.asi beside its kernels
++    if (DirExists(std::string(p) + "\\dxil") || DirExists(std::string(p) + "\\hip")) cand = p;   // release layout: <game>\x4r\x4r.asi beside its kernels
 +    if (DirExists(cand)) g_dir = cand;
 +    const size_t n = path.size();
 +    const bool asi = n > 4 && _stricmp(path.c_str() + n - 4, ".asi") == 0;
@@ -1074,16 +1248,26 @@ index 0000000..3352964
 +        SetEnvironmentVariableA("X4R_DIR", cand.c_str());          // the copy in system32 finds the kernels through this
 +        SelectOverrides();   // as early as the plugin loads: vkd3d-proton only sees VKD3D_SHADER_OVERRIDE if it is set before it initialises
 +        if (IniValue("Trace") == "true") SetEnvironmentVariableA("IGDEXT_TRACE", "1");   // x4r.ini: per-kernel GPU times in C:\\igdext_trace.log (inside the prefix)
-+        InstallFromPlugin(path);
++        if (UnderWine()) InstallFromPlugin(path);
++        else SetEnvironmentVariableA("INTC_ALT_DRIVER_EXTENSIONS_PATH", cand.c_str());   // native: <x4r>\igdext64.dll is the shim
 +    }
 +    return asi;
++}
++
++// OptiScaler (or all4r) calls this after loading x4r.asi, outside the loader lock: the native vendor id spoof needs DXGI
++extern "C" __declspec(dllexport) void InitializeASI()
++{
++    static bool done = false;
++    if (done || UnderWine()) return;
++    done = true;
++    spoof::Install();
 +}
 +
 +// 1 on an x4r install (the ANV self-test does not apply), 0 without the x4r runtime (upstream behaviour). A game whose
 +// XeSS has kernels we did not translate does not fall back to DP4a: the pipeline creation fails (X4rKernelFailed).
 +extern "C" int X4rGate()
 +{
-+    if (!DirExists(g_dir + "\\dxil")) return 0;
++    if (!DirExists(g_dir + "\\dxil") && !DirExists(g_dir + "\\hip")) return 0;   // dxil\: translated DXIL (Proton), hip\: code objects (native Windows)
 +    HMODULE m = GetModuleHandleA("libxess.dll");
 +    char path[MAX_PATH];
 +    if (m && GetModuleFileNameA(m, path, MAX_PATH))
@@ -1127,7 +1311,9 @@ index 0000000..3352964
 +            { unsigned long long kh; int n; if (sscanf(t, "%llx:%d", &kh, &n) == 2) g_dumpWant[kh][n] = true; }
 +            g_dumpOn = !g_dumpWant.empty();
 +        }
-+        if (g_dumpOn)
++        { char b[16] = {}; g_hip = (GetEnvironmentVariableA("X4R_BACKEND", b, sizeof b) && !_stricmp(b, "hip")) || IniValue("Backend") == "hip"; }
++        if (g_hip) TraceF("x4r: HIP backend (code objects in %s\\hip)", g_dir.c_str());
++        if (Tracking())
 +        {
 +            g_dev = dev; g_inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 +            CreateDirectoryA((g_dir + "\\dump").c_str(), nullptr);
@@ -1139,6 +1325,7 @@ index 0000000..3352964
 +            Patch(vtbl, 24, (void*)h_CopyDescsSimple, (void**)&o_CopyDescsSimple);
 +            Patch(vtbl, 27, (void*)h_CreateCommitted, (void**)&o_CreateCommitted);
 +            Patch(vtbl, 29, (void*)h_CreatePlaced, (void**)&o_CreatePlaced);
++            if (g_hip) Patch(vtbl, 28, (void*)h_CreateResHeap, (void**)&o_CreateResHeap);   // 28 CreateHeap
 +            TraceF("x4r: dump mode for %zu kernels into %s\\dump", g_dumpWant.size(), g_dir.c_str());
 +        }
 +        // ID3D12GraphicsCommandList vtable: 14 Dispatch, 25 SetPipelineState (shared by all lists, so one throwaway list is enough)
@@ -1152,7 +1339,7 @@ index 0000000..3352964
 +            Patch(lv, 9, (void*)h_Close, (void**)&o_Close);
 +            Patch(lv, 10, (void*)h_Reset, (void**)&o_Reset);
 +            Patch(lv, 11, (void*)h_ClearState, (void**)&o_ClearState);
-+            if (g_dumpOn)
++            if (Tracking())
 +            {
 +                // 29 SetComputeRootSignature, 31 SetComputeRootDescriptorTable, 33/35 SetComputeRoot32BitConstant(s), 37/39/41 root CBV/SRV/UAV
 +                Patch(lv, 29, (void*)h_SetRS, (void**)&o_SetRS);
@@ -1165,11 +1352,12 @@ index 0000000..3352964
 +                Patch(lv, 39, (void*)h_SetRootSrv, (void**)&o_SetRootSrv);
 +                Patch(lv, 41, (void*)h_SetRootUav, (void**)&o_SetRootUav);
 +            }
-+            if (!g_timingInit) InitTiming(dev);
++            if (!g_timingInit && !g_hip) InitTiming(dev);   // HIP mode times its batches with HIP events
 +            o_Close(cl);
 +        }
 +        if (cl) cl->Release();
 +        if (al) al->Release();
++        if (g_hip) xh::Init(dev);   // after the shim's own list hooks: d4r_split's recording stubs chain to them
 +        g_frameSyncRequested = IniValue("FrameSync") == "true" || GetEnvironmentVariableA("X4R_FRAME_SYNC", nullptr, 0) > 0;
 +        g_frameSync = g_frameSyncRequested;
 +        if (g_frameSync) {
@@ -1236,13 +1424,866 @@ index 0000000..3352964
 +    if (FILE* f = nullptr; fopen_s(&f, (g_dir + "\\captured-kernels.txt").c_str(), "ab") == 0 && f) { fprintf(f, "%016llx %016llx\n", kernelHash, rsHash); fclose(f); }
 +}
 +
++// HIP backend: whether this kernel has a code object (then it gets a placeholder pipeline and runs on HIP)
++extern "C" bool X4rHipKernel(unsigned long long kernelHash)
++{
++    if (!g_hip) return false;
++    char path[MAX_PATH]; snprintf(path, sizeof(path), "%s\\hip\\%016llx.hsaco", g_dir.c_str(), kernelHash);
++    return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
++}
++
 +extern "C" void X4rNotePipeline(ID3D12PipelineState* pso, unsigned long long kernelHash)
 +{
-+    std::lock_guard<std::mutex> l(g_mx);
-+    g_psoHash[pso] = kernelHash;
++    {
++        std::lock_guard<std::mutex> l(g_mx);
++        g_psoHash[pso] = kernelHash;
++        if (g_hip) g_kmode[kernelHash] = xh::g_wmma;
++    }
++    if (g_hip && xh::g_ok) { std::lock_guard<std::recursive_mutex> l(xh::g_hmx); xh::KernelFor(kernelHash); }   // load the code object now, not in the first frame
 +}
+diff --git a/src/dll/X4rHip.inc b/src/dll/X4rHip.inc
+new file mode 100644
+index 0000000..97b93b1
+--- /dev/null
++++ b/src/dll/X4rHip.inc
+@@ -0,0 +1,835 @@
++// SPDX-License-Identifier: GPL-3.0-only
++// x4r HIP backend (native Windows, "d3dhip"): XeSS' CM kernels run as AMDGPU code objects on AMD's HIP runtime, inside the game's
++// D3D12 frame. #included inside X4r.cpp's anonymous namespace (uses g_views, g_heaps, g_rsParams, g_bind, g_bufs, BufferAt, TraceF).
++//
++//  * Memory: the heaps libxess creates get D3D12_HEAP_FLAG_SHARED and are imported into HIP once, so its placed buffers are the
++//    same memory on both sides (its weight uploads and constant copies land where the kernels read them). libxess' own textures
++//    are only ever touched by its kernels: they live in HIP as pitch-linear shadows. The game's textures (colour, motion, depth,
++//    output...) go through shared linear buffers: a small D3D12 shader packs the inputs before HIP runs and unpacks the outputs
++//    after it (as m4r's dx_interop).
++//  * Dispatch: a dispatch of a kernel with a code object is not recorded into D3D12. Its bindings are resolved into the kernel
++//    argument (X4rArgs, see x4r_hip.h) and appended to the list's batch; copies between dispatches join the batch at their place.
++//    The game's list is split at the first such dispatch (d4r_d3d12_split.h): between the parts the queue signals a shared
++//    fence, HIP waits for it, runs the batch and signals back, and the queue waits for that before the second part.
++
++namespace xh
++{
++using namespace hipdyn;
++const Api* H = nullptr;
++std::recursive_mutex g_hmx;   // resources, records, ring, kernels (recording side)
++std::mutex g_bmx;              // g_batchOf and the second lists: also taken inside d4r_split's lock (Done), so never held around begin()
++std::mutex g_tmx;              // timing
++bool g_ok = false;
++std::string g_why;
++hipStream_t g_stream = nullptr;
++ID3D12Device* g_hdev = nullptr;
++ID3D12Fence* g_front = nullptr;            // shared: queue <-> HIP
++hipExternalSemaphore_t g_frontSem = nullptr;
++uint64_t g_frontValue = 0;
++ID3D12Fence* g_splitFence = nullptr;       // d4r_split's own wait (signalled from the CPU after the hand-off is queued)
++uint64_t g_splitValue = 0;
++ID3D12Fence* g_retire = nullptr;           // signalled behind each second part: its list can be reused
++uint64_t g_retireValue = 0;
++uintptr_t g_xessLo = 0, g_xessHi = 0;      // libxess.dll's image
++bool g_wmma = false;                       // <dir>\hip\flavour.txt says "wmma" (tools/build_hip.py --wmma)
++
++bool FromXess(void* ret)
++{
++    if (!g_xessHi)
++    {
++        HMODULE m = GetModuleHandleA("libxess.dll");
++        MODULEINFO mi = {};
++        if (!m || !GetModuleInformation(GetCurrentProcess(), m, &mi, sizeof mi)) return false;
++        g_xessLo = (uintptr_t)mi.lpBaseOfDll; g_xessHi = g_xessLo + mi.SizeOfImage;
++    }
++    return (uintptr_t)ret >= g_xessLo && (uintptr_t)ret < g_xessHi;
++}
++
++bool Ck(hipError_t e, const char* what)
++{
++    if (!e) return true;
++    TraceF("x4r: HIP %s: %s", what, H ? H->err(e) : "?");
++    return false;
++}
++
++// ---- formats -----------------------------------------------------------------------------------------------------------------
++struct Fmt { uint32_t bytes; hipChannelFormatDesc d; hipTextureReadMode rm; };
++DXGI_FORMAT Typed(DXGI_FORMAT f)
++{
++    switch (f)
++    {
++    case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
++    case DXGI_FORMAT_R32G32B32A32_TYPELESS: return DXGI_FORMAT_R32G32B32A32_FLOAT;
++    case DXGI_FORMAT_R16G16_TYPELESS: return DXGI_FORMAT_R16G16_FLOAT;
++    case DXGI_FORMAT_R32G32_TYPELESS: return DXGI_FORMAT_R32G32_FLOAT;
++    case DXGI_FORMAT_R32_TYPELESS: case DXGI_FORMAT_D32_FLOAT: return DXGI_FORMAT_R32_FLOAT;
++    case DXGI_FORMAT_R16_TYPELESS: case DXGI_FORMAT_D16_UNORM: return DXGI_FORMAT_R16_UNORM;
++    case DXGI_FORMAT_R8_TYPELESS: return DXGI_FORMAT_R8_UNORM;
++    case DXGI_FORMAT_R8G8_TYPELESS: return DXGI_FORMAT_R8G8_UNORM;
++    case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
++    case DXGI_FORMAT_R24G8_TYPELESS: case DXGI_FORMAT_D24_UNORM_S8_UINT: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
++    case DXGI_FORMAT_R32G8X24_TYPELESS: case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
++    case DXGI_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_UNORM;
++    case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
++    default: return f;
++    }
++}
++// the formats HIP can describe natively (libxess' own textures and the shared buffers' layouts)
++bool FmtOf(DXGI_FORMAT f, Fmt& o)
++{
++    const auto F = hipChannelFormatKindFloat, U = hipChannelFormatKindUnsigned;
++    const auto E = hipReadModeElementType, N = hipReadModeNormalizedFloat;
++    switch (Typed(f))
++    {
++    case DXGI_FORMAT_R16G16B16A16_FLOAT: o = {8, {16, 16, 16, 16, F}, E}; return true;
++    case DXGI_FORMAT_R32G32B32A32_FLOAT: o = {16, {32, 32, 32, 32, F}, E}; return true;
++    case DXGI_FORMAT_R16G16_FLOAT: o = {4, {16, 16, 0, 0, F}, E}; return true;
++    case DXGI_FORMAT_R32G32_FLOAT: o = {8, {32, 32, 0, 0, F}, E}; return true;
++    case DXGI_FORMAT_R32_FLOAT: o = {4, {32, 0, 0, 0, F}, E}; return true;
++    case DXGI_FORMAT_R16_FLOAT: o = {2, {16, 0, 0, 0, F}, E}; return true;
++    case DXGI_FORMAT_R16_UNORM: o = {2, {16, 0, 0, 0, U}, N}; return true;
++    case DXGI_FORMAT_R8_UNORM: o = {1, {8, 0, 0, 0, U}, N}; return true;
++    case DXGI_FORMAT_R8G8_UNORM: o = {2, {8, 8, 0, 0, U}, N}; return true;
++    case DXGI_FORMAT_R8G8B8A8_UNORM: o = {4, {8, 8, 8, 8, U}, N}; return true;
++    case DXGI_FORMAT_R16G16B16A16_UNORM: o = {8, {16, 16, 16, 16, U}, N}; return true;
++    case DXGI_FORMAT_R16G16_UNORM: o = {4, {16, 16, 0, 0, U}, N}; return true;
++    default: return false;
++    }
++}
++// shared-buffer layout for a game texture viewed with format f (the pack/unpack shaders' `layout`)
++enum Layout : uint32_t { L_RGBA16F = 0, L_R32F = 1, L_RG16F = 2, L_RGBA32F = 3 };
++Layout LayoutOf(DXGI_FORMAT f)
++{
++    switch (Typed(f))
++    {
++    case DXGI_FORMAT_R32G32B32A32_FLOAT: case DXGI_FORMAT_R32G32_FLOAT: case DXGI_FORMAT_R32G32B32_FLOAT: return L_RGBA32F;
++    case DXGI_FORMAT_R16G16_FLOAT: case DXGI_FORMAT_R16G16_UNORM: case DXGI_FORMAT_R16G16_SNORM: case DXGI_FORMAT_R8G8_UNORM:
++    case DXGI_FORMAT_R8G8_SNORM: return L_RG16F;
++    case DXGI_FORMAT_R32_FLOAT: case DXGI_FORMAT_R16_FLOAT: case DXGI_FORMAT_R16_UNORM: case DXGI_FORMAT_R8_UNORM:
++    case DXGI_FORMAT_R24_UNORM_X8_TYPELESS: case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS: return L_R32F;
++    default: return L_RGBA16F;
++    }
++}
++DXGI_FORMAT LayoutFormat(Layout l)
++{
++    return l == L_RGBA16F ? DXGI_FORMAT_R16G16B16A16_FLOAT : l == L_R32F ? DXGI_FORMAT_R32_FLOAT : l == L_RG16F ? DXGI_FORMAT_R16G16_FLOAT : DXGI_FORMAT_R32G32B32A32_FLOAT;
++}
++uint32_t LayoutBytes(Layout l) { return l == L_RGBA16F ? 8 : l == L_RGBA32F ? 16 : 4; }
++
++// ---- device-side records (texture: 64 bytes, sampled then storage descriptor; sampler: 16 bytes) ------------------------------
++uint8_t* g_arena = nullptr; size_t g_arenaHead = 0; constexpr size_t kArena = 4u << 20;
++uint64_t ArenaPut(const void* p, size_t n)
++{
++    n = (n + 63) & ~size_t(63);
++    if (!g_arena || g_arenaHead + n > kArena)
++    {
++        if (!Ck(H->hipMalloc((void**)&g_arena, kArena), "record arena")) return 0;
++        g_arenaHead = 0;
++    }
++    uint8_t* d = g_arena + g_arenaHead; g_arenaHead += n;
++    if (!Ck(H->hipMemcpy(d, p, n, hipMemcpyHostToDevice), "record upload")) return 0;
++    return (uint64_t)d;
++}
++// image descriptor HIP builds for pitch-linear memory (as hipvk's makeSrd)
++bool Srd(void* dev, uint32_t pitch, uint32_t w, uint32_t h, const Fmt& f, uint32_t out[8])
++{
++    hipResourceDesc r{}; r.resType = hipResourceTypePitch2D;
++    r.res.pitch2D.devPtr = dev; r.res.pitch2D.desc = f.d; r.res.pitch2D.width = w; r.res.pitch2D.height = h; r.res.pitch2D.pitchInBytes = pitch;
++    hipTextureDesc td{}; td.addressMode[0] = td.addressMode[1] = td.addressMode[2] = hipAddressModeClamp;
++    td.filterMode = hipFilterModePoint; td.readMode = f.rm;
++    hipTextureObject_t t = nullptr;
++    if (!Ck(H->hipCreateTextureObject(&t, &r, &td, nullptr), "hipCreateTextureObject")) return false;
++    const bool ok = Ck(H->hipMemcpy(out, (void*)t, 32, hipMemcpyDeviceToHost), "texture descriptor");
++    H->hipDestroyTextureObject(t);
++    return ok;
++}
++uint64_t TexRecord(void* dev, uint32_t pitch, uint32_t w, uint32_t h, const Fmt& f)
++{
++    uint32_t rec[16];
++    if (!Srd(dev, pitch, w, h, f, rec)) return 0;
++    memcpy(rec + 8, rec, 32);
++    return ArenaPut(rec, 64);
++}
++// D3D12 static sampler -> descriptor (dwords 12-15 of a texture object over a 1x1 image, as hipvk's CreateSampler)
++std::map<uint64_t, uint64_t> g_samplers;
++uint64_t SamplerRecord(UINT filter, UINT au, UINT av, UINT aw)
++{
++    const uint64_t key = (uint64_t)filter | ((uint64_t)au << 32) | ((uint64_t)av << 40) | ((uint64_t)aw << 48);
++    auto it = g_samplers.find(key);
++    if (it != g_samplers.end()) return it->second;
++    static void* backing = nullptr;
++    if (!backing && !Ck(H->hipMalloc(&backing, 256), "sampler backing")) return 0;
++    auto mode = [](UINT m) { return m == D3D12_TEXTURE_ADDRESS_MODE_WRAP ? hipAddressModeWrap : m == D3D12_TEXTURE_ADDRESS_MODE_MIRROR ? hipAddressModeMirror
++                                    : m == D3D12_TEXTURE_ADDRESS_MODE_BORDER ? hipAddressModeBorder : hipAddressModeClamp; };
++    hipResourceDesc r{}; r.resType = hipResourceTypePitch2D;
++    r.res.pitch2D.devPtr = backing; r.res.pitch2D.desc = {32, 0, 0, 0, hipChannelFormatKindFloat};
++    r.res.pitch2D.width = 1; r.res.pitch2D.height = 1; r.res.pitch2D.pitchInBytes = 256;
++    hipTextureDesc td{};
++    td.addressMode[0] = mode(au); td.addressMode[1] = mode(av); td.addressMode[2] = mode(aw);
++    td.filterMode = (filter & 0x14) ? hipFilterModeLinear : hipFilterModePoint;   // D3D12_FILTER: min 0x10, mag 0x4
++    td.mipmapFilterMode = (filter & 0x1) ? hipFilterModeLinear : hipFilterModePoint;
++    td.readMode = hipReadModeElementType; td.normalizedCoords = 1; td.maxMipmapLevelClamp = 1000.0f;
++    hipTextureObject_t t = nullptr;
++    uint32_t w[16] = {};
++    if (!Ck(H->hipCreateTextureObject(&t, &r, &td, nullptr), "sampler")) return 0;
++    const bool ok = Ck(H->hipMemcpy(w, (void*)t, 64, hipMemcpyDeviceToHost), "sampler descriptor");
++    H->hipDestroyTextureObject(t);
++    const uint64_t a = ok ? ArenaPut(w + 12, 16) : 0;
++    g_samplers[key] = a;
++    return a;
++}
++uint64_t g_dummyRec = 0;   // unbound slots: a 1x1 image record (buffers through it have size 0: every access is out of range)
++
++// ---- pinned ring: root constants and CPU-side (upload heap) data snapshotted at record time ------------------------------------
++uint8_t* g_ring = nullptr; size_t g_ringHead = 0; constexpr size_t kRing = 32u << 20;
++uint8_t* RingPut(const void* p, size_t n)
++{
++    const size_t a = (n + 255) & ~size_t(255);
++    if (a > kRing / 2) return nullptr;
++    if (g_ringHead + a > kRing) { H->hipStreamSynchronize(g_stream); g_ringHead = 0; }   // every earlier batch has consumed its data
++    uint8_t* d = g_ring + g_ringHead; g_ringHead += a;
++    memcpy(d, p, n);
++    return d;
++}
++
++// ---- resources ----------------------------------------------------------------------------------------------------------------
++struct HeapInfo { UINT64 size = 0; bool shared = false, tried = false; uint8_t* dev = nullptr; };
++std::map<ID3D12Heap*, HeapInfo> g_rheaps;
++struct ResInfo
++{
++    bool xess = false;
++    D3D12_RESOURCE_DESC desc = {};
++    D3D12_HEAP_TYPE heapType = D3D12_HEAP_TYPE_DEFAULT;
++    ID3D12Heap* heap = nullptr; UINT64 heapOff = 0;
++    bool shared = false, tried = false;
++    uint8_t* dev = nullptr;              // buffer: device address (imported); libxess texture: its shadow; game texture: the shared buffer
++    void* cpu = nullptr;                 // upload / readback buffer: mapped
++    uint32_t pitch = 0;
++    ID3D12Resource* staging = nullptr;   // game texture: the shared linear buffer
++    Layout layout = L_RGBA16F;
++    std::map<int, uint64_t> recs;        // view format -> texture record
++};
++std::map<ID3D12Resource*, ResInfo> g_res;
++
++void NoteResource(ID3D12Resource* r, const D3D12_RESOURCE_DESC* d, D3D12_HEAP_TYPE type, ID3D12Heap* heap, UINT64 off, bool xess, bool shared)
++{
++    std::lock_guard<std::recursive_mutex> l(g_hmx);
++    ResInfo ri; ri.xess = xess; ri.desc = *d; ri.heapType = type; ri.heap = heap; ri.heapOff = off; ri.shared = shared;
++    g_res[r] = ri;   // a new resource at a freed one's address replaces its record
++}
++void NoteHeap(ID3D12Heap* h, UINT64 size, bool shared)
++{
++    std::lock_guard<std::recursive_mutex> l(g_hmx);
++    HeapInfo hi; hi.size = size; hi.shared = shared; g_rheaps[h] = hi;
++}
++
++bool Import(HANDLE nt, UINT64 bytes, bool resource, uint8_t** out)
++{
++    hipExternalMemoryHandleDesc d{};
++    d.type = resource ? hipExternalMemoryHandleTypeD3D12Resource : hipExternalMemoryHandleTypeD3D12Heap;
++    d.handle.win32.handle = nt; d.size = bytes; d.flags = resource ? 1 : 0;   // hipExternalMemoryDedicated
++    hipExternalMemory_t m = nullptr;
++    if (!Ck(H->hipImportExternalMemory(&m, &d), "hipImportExternalMemory")) return false;
++    hipExternalMemoryBufferDesc b{}; b.size = bytes;
++    void* p = nullptr;
++    if (!Ck(H->hipExternalMemoryGetMappedBuffer(&p, m, &b), "hipExternalMemoryGetMappedBuffer")) { H->hipDestroyExternalMemory(m); return false; }
++    *out = (uint8_t*)p;
++    return true;
++}
++
++// device address of a buffer's first byte (null: not importable; upload / readback buffers are reached through ri.cpu)
++uint8_t* BufferDev(ID3D12Resource* r, ResInfo& ri)
++{
++    if (ri.dev || ri.tried) return ri.dev;
++    ri.tried = true;
++    if (ri.heapType == D3D12_HEAP_TYPE_UPLOAD || ri.heapType == D3D12_HEAP_TYPE_READBACK)
++    {
++        D3D12_RANGE none = {0, 0};
++        if (FAILED(r->Map(0, ri.heapType == D3D12_HEAP_TYPE_UPLOAD ? &none : nullptr, &ri.cpu))) ri.cpu = nullptr;
++        return nullptr;
++    }
++    if (ri.heap)
++    {
++        auto it = g_rheaps.find(ri.heap);
++        if (it == g_rheaps.end() || !it->second.shared) { TraceF("x4r: HIP: buffer %p is in a heap HIP cannot import", (void*)r); return nullptr; }
++        HeapInfo& hi = it->second;
++        if (!hi.dev && !hi.tried)
++        {
++            hi.tried = true;
++            HANDLE nt = nullptr;
++            if (SUCCEEDED(g_hdev->CreateSharedHandle(ri.heap, nullptr, GENERIC_ALL, nullptr, &nt)))
++            {
++                if (Import(nt, hi.size, false, &hi.dev)) TraceF("x4r: HIP: heap %p (%llu bytes) imported at %p", (void*)ri.heap, (unsigned long long)hi.size, hi.dev);
++                CloseHandle(nt);
++            }
++            else TraceF("x4r: HIP: no shared handle for heap %p", (void*)ri.heap);
++        }
++        if (hi.dev) ri.dev = hi.dev + ri.heapOff;
++        return ri.dev;
++    }
++    if (!ri.shared) { TraceF("x4r: HIP: buffer %p is not shared", (void*)r); return nullptr; }
++    HANDLE nt = nullptr;
++    const UINT64 bytes = g_hdev->GetResourceAllocationInfo(0, 1, &ri.desc).SizeInBytes;
++    if (SUCCEEDED(g_hdev->CreateSharedHandle(r, nullptr, GENERIC_ALL, nullptr, &nt))) { Import(nt, bytes, true, &ri.dev); CloseHandle(nt); }
++    return ri.dev;
++}
++
++// ---- the game-texture interop shaders (m4r's dx_interop) ----------------------------------------------------------------------
++static const char kInterop[] = R"(
++cbuffer C : register(b0) { uint w, h, pitch, layout; };
++Texture2D<float4> src : register(t0);
++RWByteAddressBuffer dst : register(u0);
++ByteAddressBuffer srcBuf : register(t1);
++RWTexture2D<float4> dstTex : register(u1);
++uint pack2(float a, float b) { return f32tof16(a) | (f32tof16(b) << 16); }
++[numthreads(8, 8, 1)] void pack(uint3 id : SV_DispatchThreadID) {
++    if (id.x >= w || id.y >= h) return;
++    float4 v = src.Load(int3(id.xy, 0));
++    uint off = id.y * pitch;
++    if (layout == 0) dst.Store2(off + id.x * 8, uint2(pack2(v.x, v.y), pack2(v.z, v.w)));
++    else if (layout == 1) dst.Store(off + id.x * 4, asuint(v.x));
++    else if (layout == 2) dst.Store(off + id.x * 4, pack2(v.x, v.y));
++    else dst.Store4(off + id.x * 16, asuint(v));
++}
++[numthreads(8, 8, 1)] void unpack(uint3 id : SV_DispatchThreadID) {
++    if (id.x >= w || id.y >= h) return;
++    uint off = id.y * pitch;
++    float4 v;
++    if (layout == 0) { uint2 d = srcBuf.Load2(off + id.x * 8); v = float4(f16tof32(d.x), f16tof32(d.x >> 16), f16tof32(d.y), f16tof32(d.y >> 16)); }
++    else if (layout == 1) v = float4(asfloat(srcBuf.Load(off + id.x * 4)), 0, 0, 1);
++    else if (layout == 2) { uint d = srcBuf.Load(off + id.x * 4); v = float4(f16tof32(d), f16tof32(d >> 16), 0, 1); }
++    else v = asfloat(srcBuf.Load4(off + id.x * 16));
++    dstTex[id.xy] = v;
++}
++)";
++ID3D12RootSignature* g_ioRoot = nullptr;
++ID3D12PipelineState *g_ioPack = nullptr, *g_ioUnpack = nullptr;
++ID3D12DescriptorHeap* g_ioHeap = nullptr;
++UINT g_ioNext = 0; constexpr UINT kIoHeap = 4096;
++
++bool InitInterop(ID3D12Device* dev)
++{
++    HMODULE dc = LoadLibraryA("d3dcompiler_47.dll");
++    auto compile = dc ? (pD3DCompile)GetProcAddress(dc, "D3DCompile") : nullptr;
++    using PFN_Ser = HRESULT(WINAPI*)(const D3D12_ROOT_SIGNATURE_DESC*, D3D_ROOT_SIGNATURE_VERSION, ID3DBlob**, ID3DBlob**);
++    auto ser = (PFN_Ser)GetProcAddress(GetModuleHandleA("d3d12.dll"), "D3D12SerializeRootSignature");
++    if (!compile || !ser) { g_why = "d3dcompiler_47.dll or D3D12SerializeRootSignature missing"; return false; }
++    ID3DBlob *pk = nullptr, *up = nullptr, *err = nullptr, *sig = nullptr;
++    if (FAILED(compile(kInterop, sizeof kInterop - 1, "x4r_interop", nullptr, nullptr, "pack", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &pk, &err)) ||
++        FAILED(compile(kInterop, sizeof kInterop - 1, "x4r_interop", nullptr, nullptr, "unpack", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &up, &err)))
++    { g_why = "interop shaders: " + (err ? std::string((const char*)err->GetBufferPointer(), err->GetBufferSize()) : std::string("?")); return false; }
++    D3D12_DESCRIPTOR_RANGE srv{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
++    D3D12_DESCRIPTOR_RANGE uav{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 1, 0, 0};
++    D3D12_ROOT_PARAMETER p[5] = {};
++    p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; p[0].Constants = {0, 0, 4};
++    p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; p[1].DescriptorTable = {1, &srv};
++    p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; p[2].DescriptorTable = {1, &uav};
++    p[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; p[3].Descriptor = {0, 0};
++    p[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[4].Descriptor = {1, 0};
++    D3D12_ROOT_SIGNATURE_DESC rd{5, p, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
++    if (FAILED(ser(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) ||
++        FAILED(o_CreateRootSignature(dev, 0, sig->GetBufferPointer(), sig->GetBufferSize(), __uuidof(ID3D12RootSignature), (void**)&g_ioRoot)))
++    { g_why = "interop root signature"; return false; }
++    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
++    pd.pRootSignature = g_ioRoot;
++    pd.CS = {pk->GetBufferPointer(), pk->GetBufferSize()};
++    if (FAILED(dev->CreateComputePipelineState(&pd, __uuidof(ID3D12PipelineState), (void**)&g_ioPack))) { g_why = "pack pipeline"; return false; }
++    pd.CS = {up->GetBufferPointer(), up->GetBufferSize()};
++    if (FAILED(dev->CreateComputePipelineState(&pd, __uuidof(ID3D12PipelineState), (void**)&g_ioUnpack))) { g_why = "unpack pipeline"; return false; }
++    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kIoHeap, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
++    if (FAILED(dev->CreateDescriptorHeap(&hd, __uuidof(ID3D12DescriptorHeap), (void**)&g_ioHeap))) { g_why = "interop descriptor heap"; return false; }
++    pk->Release(); up->Release(); sig->Release();
++    return true;
++}
++
++// the shared linear buffer of a game texture (recreated when the texture's size changes); false: not usable
++bool GameStaging(ID3D12Resource* r, ResInfo& ri, DXGI_FORMAT viewFmt)
++{
++    if (ri.staging) return ri.dev != nullptr;
++    const D3D12_RESOURCE_DESC td = r->GetDesc();
++    ri.desc = td;
++    ri.layout = LayoutOf(viewFmt ? viewFmt : td.Format);
++    ri.pitch = ((uint32_t)td.Width * LayoutBytes(ri.layout) + 255) & ~255u;
++    D3D12_RESOURCE_DESC bd{};
++    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = (UINT64)ri.pitch * td.Height; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
++    bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR; bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
++    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
++    if (FAILED(o_CreateCommitted(g_hdev, &hp, D3D12_HEAP_FLAG_SHARED, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, __uuidof(ID3D12Resource), (void**)&ri.staging)))
++    { TraceF("x4r: HIP: no shared buffer for game texture %p", (void*)r); return false; }
++    HANDLE nt = nullptr;
++    const UINT64 bytes = g_hdev->GetResourceAllocationInfo(0, 1, &bd).SizeInBytes;
++    if (SUCCEEDED(g_hdev->CreateSharedHandle(ri.staging, nullptr, GENERIC_ALL, nullptr, &nt))) { Import(nt, bytes, true, &ri.dev); CloseHandle(nt); }
++    TraceF("x4r: HIP: game texture %p %llux%u fmt %d -> shared buffer layout %u pitch %u (%s)", (void*)r, (unsigned long long)td.Width, td.Height,
++           (int)td.Format, (unsigned)ri.layout, ri.pitch, ri.dev ? "imported" : "import FAILED");
++    return ri.dev != nullptr;
++}
++
++D3D12_CPU_DESCRIPTOR_HANDLE IoCpu(UINT i) { auto h = g_ioHeap->GetCPUDescriptorHandleForHeapStart(); h.ptr += (SIZE_T)i * g_inc; return h; }
++D3D12_GPU_DESCRIPTOR_HANDLE IoGpu(UINT i) { auto h = g_ioHeap->GetGPUDescriptorHandleForHeapStart(); h.ptr += (UINT64)i * g_inc; return h; }
++
++// records the conversion between a game texture and its shared buffer into `l` (bypassing the shim's own tracking hooks)
++void RecordInterop(ID3D12GraphicsCommandList* l, ID3D12Resource* tex, ResInfo& ri, DXGI_FORMAT viewFmt, bool pack)
++{
++    l->SetDescriptorHeaps(1, &g_ioHeap);
++    o_SetRS(l, g_ioRoot);
++    const UINT slot = g_ioNext++ % kIoHeap;   // reused kIoHeap views later: many frames on
++    if (pack)
++    {
++        D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
++        sd.Format = Typed(viewFmt ? viewFmt : ri.desc.Format); sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; sd.Texture2D.MipLevels = 1;
++        o_CreateSRV(g_hdev, tex, &sd, IoCpu(slot));
++        o_SetTable(l, 1, IoGpu(slot));
++        o_SetRootUav(l, 3, ri.staging->GetGPUVirtualAddress());
++    }
++    else
++    {
++        D3D12_UNORDERED_ACCESS_VIEW_DESC ud{};
++        ud.Format = Typed(viewFmt ? viewFmt : ri.desc.Format); ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
++        o_CreateUAV(g_hdev, tex, nullptr, &ud, IoCpu(slot));
++        o_SetTable(l, 2, IoGpu(slot));
++        o_SetRootSrv(l, 4, ri.staging->GetGPUVirtualAddress());
++    }
++    const uint32_t c[4] = {(uint32_t)ri.desc.Width, ri.desc.Height, ri.pitch, (uint32_t)ri.layout};
++    o_SetConsts(l, 0, 4, c, 0);
++    o_SetPSO(l, pack ? g_ioPack : g_ioUnpack);
++    o_Dispatch(l, ((UINT)ri.desc.Width + 7) / 8, (ri.desc.Height + 7) / 8, 1);
++}
++
++// texture record for a view of `r` with format f: a libxess texture's shadow, else the game texture's shared buffer
++uint64_t TextureSlot(ID3D12Resource* r, DXGI_FORMAT f)
++{
++    auto it = g_res.find(r);
++    if (it == g_res.end()) it = g_res.emplace(r, ResInfo{}).first;   // created before the hooks: the game's
++    ResInfo& ri = it->second;
++    auto rec = ri.recs.find((int)f);
++    if (rec != ri.recs.end()) return rec->second;
++    uint64_t a = 0;
++    if (ri.xess)
++    {
++        Fmt res, view;
++        if (!FmtOf(ri.desc.Format, res) || !FmtOf(f ? f : ri.desc.Format, view) || res.bytes != view.bytes)
++        { TraceF("x4r: HIP: libxess texture %p: format %d / view %d not supported", (void*)r, (int)ri.desc.Format, (int)f); ri.recs[(int)f] = 0; return 0; }
++        if (!ri.dev)
++        {
++            ri.pitch = ((uint32_t)ri.desc.Width * res.bytes + 255) & ~255u;
++            const size_t bytes = (size_t)ri.pitch * ri.desc.Height;
++            if (!Ck(H->hipMalloc((void**)&ri.dev, bytes), "texture shadow")) { ri.dev = nullptr; return 0; }
++            H->hipMemsetAsync(ri.dev, 0, bytes, g_stream);
++            TraceF("x4r: HIP: libxess texture %p %llux%u fmt %d -> shadow %p pitch %u", (void*)r, (unsigned long long)ri.desc.Width, ri.desc.Height,
++                   (int)ri.desc.Format, ri.dev, ri.pitch);
++        }
++        a = TexRecord(ri.dev, ri.pitch, (uint32_t)ri.desc.Width, ri.desc.Height, view);
++    }
++    else
++    {
++        if (!GameStaging(r, ri, f)) { ri.recs[(int)f] = 0; return 0; }
++        Fmt lf; FmtOf(LayoutFormat(ri.layout), lf);
++        a = TexRecord(ri.dev, ri.pitch, (uint32_t)ri.desc.Width, ri.desc.Height, lf);
++    }
++    ri.recs[(int)f] = a;
++    return a;
++}
++
++// ---- kernels ------------------------------------------------------------------------------------------------------------------
++struct Kernel { hipModule_t mod = nullptr; hipFunction_t fn = nullptr; int block = 0; };
++std::map<unsigned long long, Kernel> g_kernels;
++Kernel* KernelFor(unsigned long long h)
++{
++    auto it = g_kernels.find(h);
++    if (it != g_kernels.end()) return it->second.fn ? &it->second : nullptr;
++    Kernel& k = g_kernels[h];
++    char path[MAX_PATH]; snprintf(path, sizeof path, "%s\\hip\\%016llx.hsaco", g_dir.c_str(), h);
++    std::vector<char> co;
++    if (FILE* f = nullptr; fopen_s(&f, path, "rb") == 0 && f)
++    {
++        fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
++        if (n > 0) { co.resize(n); if (fread(co.data(), 1, n, f) != (size_t)n) co.clear(); }
++        fclose(f);
++    }
++    if (co.empty() || !Ck(H->hipModuleLoadData(&k.mod, co.data()), path) || !Ck(H->hipModuleGetFunction(&k.fn, k.mod, "x4r_main"), "x4r_main") ||
++        !Ck(H->hipFuncGetAttribute(&k.block, 0 /* HIP_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK */, k.fn), "workgroup size"))
++    { k.fn = nullptr; X4rKernelFailed(h, "HIP code object unusable"); return nullptr; }
++    return &k;
++}
++
++// ---- batches ------------------------------------------------------------------------------------------------------------------
++struct X4rArgs { uint64_t slot[56]; uint32_t size[56]; };
++struct Op { int kind = 0; hipFunction_t fn = nullptr; int block = 0; UINT g[3] = {}; X4rArgs a; uint8_t *dst = nullptr; const uint8_t* src = nullptr; size_t n = 0; };   // 0 launch, 1 copy
++struct Second { ID3D12CommandAllocator* alloc = nullptr; ID3D12GraphicsCommandList* list = nullptr; D3D12_COMMAND_LIST_TYPE type; bool busy = false; uint64_t retire = 0; };
++struct Batch { ID3D12GraphicsCommandList* list = nullptr; Second* second = nullptr; std::vector<Op> ops; };
++std::vector<Second*> g_seconds;
++std::map<void*, Batch*> g_batchOf;           // the game's list and its second part -> the batch recording there
++std::map<ID3D12Resource*, std::pair<int, int>> g_gamePending;   // game textures libxess viewed since the last batch: SRV / UAV view format (0: none)
++
++// GPU time of the hand-off (D3D12 timestamps at the end of the first part and the start of the second: queue -> HIP -> queue)
++constexpr UINT kQ = 64;
++ID3D12QueryHeap* g_qh = nullptr;
++ID3D12Resource* g_qrb = nullptr;
++const UINT64* g_qmapped = nullptr;
++uint64_t g_qRetire[kQ] = {};   // slot -> retire value of its batch (0: free)
++UINT g_qNext = 0;
++double g_qFreq = 0, g_hipMs = 0; int g_hipFrames = 0;
++std::atomic<unsigned long long> g_hipLaunches{0}, g_hipBatches{0};
++
++void Collect()   // g_hmx held
++{
++    if (!g_qmapped) return;
++    const uint64_t done = g_retire->GetCompletedValue();
++    for (UINT i = 0; i < kQ; ++i)
++    {
++        if (!g_qRetire[i] || g_qRetire[i] > done) continue;
++        g_qRetire[i] = 0;
++        const UINT64 t0 = g_qmapped[2 * i], t1 = g_qmapped[2 * i + 1];
++        if (t1 < t0 || !g_qFreq) continue;
++        g_hipMs += (t1 - t0) * 1000.0 / g_qFreq;
++        if (++g_hipFrames % 120 == 0)
++        {
++            TraceF("x4r: HIP xess time per frame (queue to HIP to queue, avg of last 120): %.3f ms", g_hipMs / 120);
++            WriteStatus(g_hipMs / 120);
++            g_hipMs = 0;
++        }
++    }
++}
++
++void BeforeSecond(void* owner, ID3D12CommandQueue* q)
++{
++    Batch* b = (Batch*)owner;
++    std::lock_guard<std::mutex> l(g_tmx);
++    const uint64_t a = ++g_frontValue, z = ++g_frontValue;
++    hipExternalSemaphoreWaitParams wp{}; wp.params.fence.value = a;
++    hipExternalSemaphoreSignalParams sp{}; sp.params.fence.value = z;
++    bool ok = SUCCEEDED(q->Signal(g_front, a)) && Ck(H->hipWaitExternalSemaphoresAsync(&g_frontSem, &wp, 1, g_stream), "semaphore wait");
++    if (!g_qFreq) { UINT64 f = 0; if (SUCCEEDED(q->GetTimestampFrequency(&f))) g_qFreq = (double)f; }
++    for (size_t i = 0; i < b->ops.size(); ++i)
++    {
++        Op& o = b->ops[i];
++        if (!ok) break;
++        if (o.kind == 1) { ok = Ck(H->hipMemcpyAsync(o.dst, o.src, o.n, hipMemcpyDefault, g_stream), "batch copy"); continue; }
++        void* params[] = {&o.a};
++        static const bool prof = GetEnvironmentVariableA("X4R_HIP_PROFILE", nullptr, 0) > 0;   // debug: wall time of every launch (serialises)
++        LARGE_INTEGER f, t0, t1;
++        if (prof) { H->hipStreamSynchronize(g_stream); QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0); }
++        ok = Ck(H->hipModuleLaunchKernel(o.fn, o.g[0], o.g[1], o.g[2], (unsigned)o.block, 1, 1, 0, g_stream, params, nullptr), "launch");
++        if (prof)
++        {
++            H->hipStreamSynchronize(g_stream); QueryPerformanceCounter(&t1);
++            unsigned long long kh = 0; for (auto& [h2, k] : g_kernels) if (k.fn == o.fn) kh = h2;
++            TraceF("x4r: HIP profile kernel %016llx grid %u %u %u block %d: %.3f ms", kh, o.g[0], o.g[1], o.g[2], o.block, (t1.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart);
++        }
++        ++g_hipLaunches;
++    }
++    ok = ok && Ck(H->hipSignalExternalSemaphoresAsync(&g_frontSem, &sp, 1, g_stream), "semaphore signal");
++    static const bool sync = GetEnvironmentVariableA("X4R_HIP_SYNC", nullptr, 0) > 0;   // debug: wall-clock pieces of the hand-off
++    if (sync && ok)
++    {
++        LARGE_INTEGER f, t0, t1, t2; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
++        UINT64 v0 = g_front->GetCompletedValue();
++        while (g_front->GetCompletedValue() < a) {} QueryPerformanceCounter(&t1);
++        H->hipStreamSynchronize(g_stream); QueryPerformanceCounter(&t2);
++        auto ms = [&](LARGE_INTEGER x, LARGE_INTEGER y) { return (y.QuadPart - x.QuadPart) * 1000.0 / f.QuadPart; };
++        TraceF("x4r: HIP sync: fence %llu->%llu first part %.3f ms, HIP %.3f ms", v0, a, ms(t0, t1), ms(t1, t2));
++    }
++    if (!ok || FAILED(q->Wait(g_front, z))) { g_front->Signal(z); TraceF("x4r: HIP: hand-off failed, batch of %zu ops dropped", b->ops.size()); }
++    const unsigned long long nb = ++g_hipBatches;
++    if (nb <= 12 || nb % 120 == 0)
++    {
++        size_t launches = 0; for (const Op& o : b->ops) launches += o.kind == 0;
++        TraceF("x4r: HIP batch %llu: %zu launches, %zu copies, list %p queue %p", nb, launches, b->ops.size() - launches, (void*)b->list, (void*)q);
++    }
++}
++
++void Done(void* owner, bool executed)
++{
++    Batch* b = (Batch*)owner;
++    std::lock_guard<std::mutex> l(g_bmx);
++    g_batchOf.erase(b->list); g_batchOf.erase(b->second->list);
++    if (!executed) b->second->retire = 0;    // closed, never submitted: free at once
++    b->second->busy = false;
++    delete b;
++}
++
++Second* AcquireSecond(D3D12_COMMAND_LIST_TYPE type)
++{
++    const uint64_t done = g_retire->GetCompletedValue();
++    Second* free = nullptr;
++    {
++        std::lock_guard<std::mutex> g(g_bmx);
++        for (Second* s : g_seconds)
++            if (!s->busy && s->type == type && s->retire <= done) { s->busy = true; free = s; break; }
++    }
++    if (free)
++    {
++        if (SUCCEEDED(free->alloc->Reset()) && SUCCEEDED(free->list->Reset(free->alloc, nullptr))) return free;
++        std::lock_guard<std::mutex> g(g_bmx); free->busy = false; free->retire = ~0ull;   // unusable from now on
++    }
++    Second* s = new Second; s->type = type;
++    if (FAILED(g_hdev->CreateCommandAllocator(type, __uuidof(ID3D12CommandAllocator), (void**)&s->alloc)) ||
++        FAILED(g_hdev->CreateCommandList(0, type, s->alloc, nullptr, __uuidof(ID3D12GraphicsCommandList), (void**)&s->list)))
++    { delete s; return nullptr; }
++    s->busy = true;
++    std::lock_guard<std::mutex> g(g_bmx); g_seconds.push_back(s);
++    return s;
++}
++
++// the first HIP dispatch in `l`: pack the game's inputs, split the list, queue the outputs' unpack behind HIP
++Batch* StartBatch(ID3D12GraphicsCommandList* l)
++{
++    std::map<ID3D12Resource*, std::pair<int, int>> pend;
++    pend.swap(g_gamePending);
++    std::vector<std::pair<ID3D12Resource*, int>> unpacks;
++    bool packed = false;
++    for (auto& [r, fm] : pend)
++    {
++        auto it = g_res.find(r);
++        if (it == g_res.end()) it = g_res.emplace(r, ResInfo{}).first;
++        if (it->second.xess) continue;
++        if (!GameStaging(r, it->second, (DXGI_FORMAT)(fm.first ? fm.first : fm.second))) continue;
++        if (fm.first) { RecordInterop(l, r, it->second, (DXGI_FORMAT)fm.first, true); packed = true; }
++        if (fm.second) unpacks.push_back({r, fm.second});
++    }
++    Collect();
++    Second* s = AcquireSecond(l->GetType());
++    if (!s) { TraceF("x4r: HIP: no second list"); return nullptr; }
++    Batch* b = new Batch; b->list = l; b->second = s;
++    s->retire = ++g_retireValue;
++    UINT qs = UINT_MAX;
++    if (g_qh) for (UINT k = 0; k < kQ && qs == UINT_MAX; ++k) { const UINT c = (g_qNext + k) % kQ; if (!g_qRetire[c]) qs = c; }
++    if (qs != UINT_MAX) { g_qNext = qs + 1; l->EndQuery(g_qh, D3D12_QUERY_TYPE_TIMESTAMP, 2 * qs); }
++    if (!d4r_split::begin(l, s->list, g_splitFence, ++g_splitValue, g_retire, s->retire, &Done, b, &BeforeSecond, b))
++    { TraceF("x4r: HIP: list %p cannot be split", (void*)l); s->list->Close(); std::lock_guard<std::mutex> g(g_bmx); s->busy = false; s->retire = 0; delete b; return nullptr; }
++    {
++        std::lock_guard<std::mutex> g(g_mx);
++        g_bind[s->list] = g_bind[l];
++        g_curPso[s->list] = g_curPso[l];
++    }
++    if (qs != UINT_MAX)
++    {
++        s->list->EndQuery(g_qh, D3D12_QUERY_TYPE_TIMESTAMP, 2 * qs + 1);
++        s->list->ResolveQueryData(g_qh, D3D12_QUERY_TYPE_TIMESTAMP, 2 * qs, 2, g_qrb, (UINT64)qs * 16);
++        g_qRetire[qs] = s->retire;
++    }
++    for (auto& [r, f] : unpacks) RecordInterop(s->list, r, g_res[r], (DXGI_FORMAT)f, false);
++    if (!unpacks.empty() || packed) { D3D12_RESOURCE_BARRIER ub = {}; ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; s->list->ResourceBarrier(1, &ub); }
++    std::lock_guard<std::mutex> g(g_bmx);
++    g_batchOf[l] = b; g_batchOf[s->list] = b;
++    return b;
++}
++
++// buffer range -> HIP address (upload heaps: a snapshot of the bytes as they are now)
++uint64_t BufferSlot(ID3D12Resource* r, UINT64 off, UINT64& size)
++{
++    auto it = g_res.find(r);
++    if (it == g_res.end()) { TraceF("x4r: HIP: unknown buffer %p", (void*)r); size = 0; return 0; }
++    ResInfo& ri = it->second;
++    const UINT64 total = ri.desc.Width;
++    if (off >= total) { size = 0; return 0; }
++    if (!size || off + size > total) size = total - off;
++    uint8_t* d = BufferDev(r, ri);
++    if (d) return (uint64_t)(d + off);
++    if (ri.cpu && ri.heapType == D3D12_HEAP_TYPE_UPLOAD) { uint8_t* p = RingPut((const uint8_t*)ri.cpu + off, (size_t)size); if (p) return (uint64_t)p; }
++    TraceF("x4r: HIP: buffer %p (heap type %d) has no HIP address", (void*)r, (int)ri.heapType);
++    size = 0;
++    return 0;
++}
++
++struct Bound { char k; UINT reg; ViewRec v; bool have; UINT64 va; std::vector<UINT> consts; };
++
++// resolves the list's current bindings into the kernel argument
++void Resolve(ID3D12GraphicsCommandList* l, X4rArgs& a)
++{
++    std::vector<Bound> bs;
++    std::vector<SampRec> samps;
++    {
++        std::lock_guard<std::mutex> g(g_mx);
++        const ListBind& b = g_bind[l];
++        auto ps = g_rsParams.find(b.rs);
++        if (ps == g_rsParams.end()) { TraceF("x4r: HIP: dispatch without a parsed root signature (%016llx)", b.rs); return; }
++        auto ss = g_rsSamp.find(b.rs);
++        if (ss != g_rsSamp.end()) samps = ss->second;
++        for (UINT pi = 0; pi < ps->second.size(); ++pi)
++        {
++            const ParamRec& p = ps->second[pi];
++            if (p.type == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS)
++            {
++                Bound x{'c', p.reg, {}, true, 0, {}};
++                auto c = b.consts.find(pi); if (c != b.consts.end()) x.consts = c->second;
++                x.consts.resize(p.n);
++                bs.push_back(x);
++                continue;
++            }
++            if (p.type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
++            {
++                auto v = b.rootVa.find(pi);
++                const char k = p.type == D3D12_ROOT_PARAMETER_TYPE_CBV ? 'B' : p.type == D3D12_ROOT_PARAMETER_TYPE_SRV ? 'T' : 'U';
++                if (v != b.rootVa.end()) bs.push_back({k, p.reg, {}, true, v->second, {}});
++                continue;
++            }
++            auto t = b.tables.find(pi);
++            if (t == b.tables.end()) continue;
++            UINT run = 0;
++            for (const RangeRec& rg : p.ranges)
++            {
++                const UINT start = rg.offset == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND ? run : rg.offset;
++                const UINT count = rg.count == UINT_MAX ? 1 : rg.count;
++                const char k = rg.type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV ? 't' : rg.type == D3D12_DESCRIPTOR_RANGE_TYPE_UAV ? 'u' : rg.type == D3D12_DESCRIPTOR_RANGE_TYPE_CBV ? 'b' : 's';
++                for (UINT i = 0; i < count && k != 's'; ++i)
++                {
++                    const UINT64 gh = t->second + (UINT64)(start + i) * g_inc;
++                    Bound x{k, rg.base + i, {}, false, 0, {}};
++                    for (const HeapRec& h : g_heaps)
++                        if (gh >= h.gpu && gh < h.gpu + (UINT64)h.n * g_inc) { auto it = g_views.find(h.cpu + (SIZE_T)(gh - h.gpu)); if (it != g_views.end()) { x.v = it->second; x.have = true; } break; }
++                    bs.push_back(x);
++                }
++                run = start + count;
++            }
++        }
++    }
++    for (int i = 0; i < 56; ++i) { a.slot[i] = g_dummyRec; a.size[i] = 0; }
++    for (const SampRec& s : samps) if (s.reg < 4) a.slot[52 + s.reg] = SamplerRecord(s.filter, s.u, s.v, s.w);
++    std::lock_guard<std::mutex> g(g_mx);   // BufferAt reads g_bufs
++    for (Bound& x : bs)
++    {
++        const int base = (x.k == 't' || x.k == 'T') ? 0 : (x.k == 'u' || x.k == 'U') ? 16 : 32;
++        const int slot = base + (int)x.reg;
++        if (slot >= 52 || (base < 32 && x.reg >= 16)) { TraceF("x4r: HIP: register %c%u outside the kernel argument", x.k, x.reg); continue; }
++        if (x.k == 'c')
++        {
++            uint8_t* p = RingPut(x.consts.data(), x.consts.size() * 4);
++            a.slot[slot] = (uint64_t)p; a.size[slot] = (uint32_t)(x.consts.size() * 4);
++            continue;
++        }
++        if (x.k == 'B' || x.k == 'T' || x.k == 'U')
++        {
++            auto [r, off] = BufferAt(x.va);
++            UINT64 size = x.k == 'B' ? 65536 : 0;
++            if (r) { a.slot[slot] = BufferSlot(r, off, size); a.size[slot] = (uint32_t)size; }
++            continue;
++        }
++        if (!x.have) continue;
++        const ViewRec& v = x.v;
++        if (v.kind == 3)
++        {
++            auto [r, off] = BufferAt(v.va);
++            UINT64 size = v.size;
++            if (r) { a.slot[slot] = BufferSlot(r, off, size); a.size[slot] = (uint32_t)size; }
++            continue;
++        }
++        if (!v.res) continue;
++        if (v.buffer)
++        {
++            UINT64 size = (UINT64)v.num * v.stride;
++            a.slot[slot] = BufferSlot(v.res, v.first * v.stride, size); a.size[slot] = (uint32_t)size;
++            continue;
++        }
++        if (const uint64_t rec = TextureSlot(v.res, v.fmt)) a.slot[slot] = rec;
++    }
++}
++
++bool Dispatch(ID3D12GraphicsCommandList* l, unsigned long long h, UINT x, UINT y, UINT z)
++{
++    if (!g_ok) return false;
++    std::lock_guard<std::recursive_mutex> lk(g_hmx);
++    Kernel* k = KernelFor(h);
++    if (!k) return false;
++    Batch* b = nullptr;
++    { std::lock_guard<std::mutex> g(g_bmx); auto it = g_batchOf.find(l); if (it != g_batchOf.end()) b = it->second; }
++    if (!b) b = StartBatch(l);
++    if (!b) return true;   // dropped (logged): never run the placeholder in its place
++    Op o; o.kind = 0; o.fn = k->fn; o.block = k->block; o.g[0] = x; o.g[1] = y; o.g[2] = z;
++    Resolve(l, o.a);
++    if (x && y && z) b->ops.push_back(o);
++    return true;
++}
++
++// CopyBufferRegion while `l` records a batch: it runs in the batch, at its place (the D3D12 copy would land after HIP)
++bool Copy(ID3D12GraphicsCommandList* l, ID3D12Resource* d, UINT64 doff, ID3D12Resource* s, UINT64 soff, UINT64 n)
++{
++    if (!g_ok) return false;
++    std::lock_guard<std::recursive_mutex> lk(g_hmx);
++    Batch* b = nullptr;
++    { std::lock_guard<std::mutex> g(g_bmx); auto it = g_batchOf.find(l); if (it != g_batchOf.end()) b = it->second; }
++    if (!b) return false;
++    auto di = g_res.find(d), si = g_res.find(s);
++    if (di == g_res.end() || si == g_res.end()) { TraceF("x4r: HIP: copy between unknown buffers in a batch (D3D12 copy kept)"); return false; }
++    uint8_t* dst = BufferDev(d, di->second);
++    uint8_t* sd = BufferDev(s, si->second);
++    const uint8_t* src = sd ? sd + soff : nullptr;
++    if (!sd && si->second.cpu && si->second.heapType == D3D12_HEAP_TYPE_UPLOAD) src = RingPut((const uint8_t*)si->second.cpu + soff, (size_t)n);
++    if (!dst || !src) { TraceF("x4r: HIP: copy %p -> %p not reachable from HIP (D3D12 copy kept)", (void*)s, (void*)d); return false; }
++    Op o; o.kind = 1; o.dst = dst + doff; o.src = src; o.n = (size_t)n;
++    b->ops.push_back(o);
++    return true;
++}
++
++void NoteView(ID3D12Resource* r, DXGI_FORMAT f, bool uav, void* ret)
++{
++    if (!g_ok || !r || !FromXess(ret)) return;
++    std::lock_guard<std::recursive_mutex> lk(g_hmx);
++    auto it = g_res.find(r);
++    if (it != g_res.end() && (it->second.xess || it->second.desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)) return;
++    if (it == g_res.end() && r->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return;
++    auto& p = g_gamePending[r];
++    (uav ? p.second : p.first) = f ? (int)f : (int)r->GetDesc().Format;
++}
++
++void Init(ID3D12Device* dev)
++{
++    const char* why = nullptr;
++    g_hdev = dev;
++    if (!(H = load(&why))) { g_why = why ? why : "HIP runtime"; }
++    else if (!Ck(H->hipStreamCreateWithFlags(&g_stream, hipStreamNonBlocking), "stream")) g_why = "HIP stream";
++    else if (FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_SHARED, __uuidof(ID3D12Fence), (void**)&g_front)) ||
++             FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), (void**)&g_splitFence)) ||
++             FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), (void**)&g_retire))) g_why = "fences";
++    else
++    {
++        HANDLE nt = nullptr;
++        hipExternalSemaphoreHandleDesc sd{}; sd.type = hipExternalSemaphoreHandleTypeD3D12Fence;
++        if (FAILED(dev->CreateSharedHandle(g_front, nullptr, GENERIC_ALL, nullptr, &nt))) g_why = "fence handle";
++        else
++        {
++            sd.handle.win32.handle = nt;
++            if (!Ck(H->hipImportExternalSemaphore(&g_frontSem, &sd), "fence import")) g_why = "HIP fence import";
++            CloseHandle(nt);
++        }
++    }
++    const char* splitWhy = nullptr;
++    if (g_why.empty() && !InitInterop(dev)) {}
++    else if (g_why.empty() && !d4r_split::install(dev, &splitWhy)) g_why = std::string("command list split: ") + (splitWhy ? splitWhy : "?");
++    else if (g_why.empty() && !Ck(H->hipHostMalloc((void**)&g_ring, kRing, 0), "pinned ring")) g_why = "pinned ring";
++    if (g_why.empty())
++    {
++        void* px = nullptr;
++        Fmt f; FmtOf(DXGI_FORMAT_R32G32B32A32_FLOAT, f);
++        if (Ck(H->hipMalloc(&px, 256), "dummy image") && Ck(H->hipMemsetAsync(px, 0, 256, g_stream), "dummy image") && Ck(H->hipStreamSynchronize(g_stream), "dummy image")) g_dummyRec = TexRecord(px, 256, 1, 1, f);
++        if (!g_dummyRec) g_why = "dummy record";
++    }
++    if (g_why.empty())   // timing is optional
++    {
++        D3D12_QUERY_HEAP_DESC qd = {}; qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP; qd.Count = 2 * kQ;
++        D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_READBACK;
++        D3D12_RESOURCE_DESC rd = {}; rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = 16 * kQ; rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
++        rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++        void* m = nullptr;
++        if (SUCCEEDED(dev->CreateQueryHeap(&qd, __uuidof(ID3D12QueryHeap), (void**)&g_qh)) &&
++            SUCCEEDED(o_CreateCommitted(dev, &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, __uuidof(ID3D12Resource), (void**)&g_qrb)) &&
++            SUCCEEDED(g_qrb->Map(0, nullptr, &m)))
++            g_qmapped = (const UINT64*)m;
++        else g_qh = nullptr;
++    }
++    g_ok = g_why.empty();
++    if (g_ok)
++    {
++        const std::string arch = deviceArch();
++        g_gpuDesc = "HIP " + arch;
++        g_gen = arch.rfind("gfx12", 0) == 0 ? 4 : arch.rfind("gfx11", 0) == 0 ? 3 : arch.rfind("gfx103", 0) == 0 ? 2 : 0;
++        if (FILE* f = nullptr; fopen_s(&f, (g_dir + "\\hip\\flavour.txt").c_str(), "rb") == 0 && f)
++        { char b[16] = {}; fread(b, 1, sizeof b - 1, f); fclose(f); g_wmma = !strncmp(b, "wmma", 4); }
++    }
++    if (g_ok) TraceF("x4r: HIP backend ready on %s (code objects in %s\\hip)", deviceArch(), g_dir.c_str());
++    else TraceF("x4r: HIP backend unavailable: %s", g_why.c_str());
++    if (FILE* f = nullptr; fopen_s(&f, (g_dir + "\\hip-status.txt").c_str(), "wb") == 0 && f)
++    { fprintf(f, "hip=%s\narch=%s\nreason=%s\n", g_ok ? "ready" : "unavailable", g_ok ? deviceArch() : "", g_why.c_str()); fclose(f); }
++}
++} // namespace xh
 diff --git a/src/dll/XellDriver.cpp b/src/dll/XellDriver.cpp
-index a8b9d26..b05d61c 100644
+index a886da7..2b62510 100644
 --- a/src/dll/XellDriver.cpp
 +++ b/src/dll/XellDriver.cpp
 @@ -126,7 +126,7 @@ HRESULT _INTC_D3D12_RenderSubmitStart(INTCExtensionContext*, uint32_t frameId)
@@ -1254,3 +2295,707 @@ index a8b9d26..b05d61c 100644
          TraceF("XELLPROBE RenderSubmitStart(frame %u) from %s", frameId, where);
      }
      return ProbeVersion() > 0 ? S_OK : E_NOTIMPL;
+diff --git a/src/dll/d4r_d3d12_split.h b/src/dll/d4r_d3d12_split.h
+new file mode 100644
+index 0000000..a8c8c7e
+--- /dev/null
++++ b/src/dll/d4r_d3d12_split.h
+@@ -0,0 +1,333 @@
++// From d4r (github.com/countervolts/d4r, tools/d4r_d3d12_split.h), GPL-3.0-only.
++// d4r_d3d12_split.h: the native D3D12 counterpart of vkd3d-proton's SplitCommandListForExternalWait
++// (patches/vkd3d-proton 0001). NGX hands the shim the game's open command list in the middle of a frame; DLSS can only
++// run once the inputs recorded so far have executed, and the game's later work in the same list reads the result.
++// begin() splits the list at that point: whatever the game (or the shim) records into it afterwards goes into a
++// second list d4r owns, and ExecuteCommandLists submits the first part, a queue Wait until `fence` reaches `value`
++// (signalled once DLSS has written its result), then the second part. The game sees one list.
++//
++// Recording is redirected by replacing every recording method of ID3D12GraphicsCommandList (vtable slots from
++// ClearState on) with a generic forwarding stub: it maps the list being called to the list it records into, keeps
++// every argument register as it was and jumps to the original method, so no method needs its own wrapper. Close
++// closes both parts; Reset of a part that was never executed drops the split (discarded). The second part starts
++// with no bound state, as NGX's evaluate leaves the list's state undefined for the caller anyway.
++//
++// Include in one translation unit; needs d4r_d3d12_submit.h's hooks (installed first).
++#pragma once
++#include "d4r_d3d12_submit.h"
++#include <atomic>
++#include <cstdint>
++#include <mutex>
++#include <vector>
++
++namespace d4r_split {
++constexpr size_t CloseSlot = 9, FirstRedirected = 11, MaxSlots = 86, MaxSplits = 16;
++
++struct Split {
++    std::atomic<ID3D12GraphicsCommandList*> list{nullptr}; // the game's list
++    std::atomic<bool> recording{false};                    // calls on `list` go to `second`
++    ID3D12GraphicsCommandList* second = nullptr;
++    ID3D12Fence* fence = nullptr;  // the second part waits until it reaches value
++    uint64_t value = 0;
++    ID3D12Fence* retire = nullptr; // signalled to retireValue on the same queue after the second part
++    uint64_t retireValue = 0;
++    bool closed = false;
++    void (*done)(void* owner, bool executed) = nullptr;
++    void* owner = nullptr;
++    // Called on the thread that executes the list, after the first part has been submitted and before the second
++    // part's wait: it may block (d3dhip runs the HIP network here) and queue work on the same queue. `fence` is
++    // signalled to `value` from the CPU once it returns, so the wait cannot hang.
++    void (*beforeSecond)(void* owner, ID3D12CommandQueue* queue) = nullptr;
++    void* beforeOwner = nullptr;
++};
++
++namespace detail {
++using Close = HRESULT(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*);
++inline Split splits[MaxSplits];
++inline std::atomic<int> active{0};
++inline std::mutex mutex;
++inline Close close = nullptr;
++inline std::atomic<bool> ready{false};
++} // namespace detail
++} // namespace d4r_split
++
++#if defined(D4R_D3D12_SPLIT_DECL)
++// The stubs and their tables are assembled once, in the unit that owns the DLL entry point; a unit that only
++// redirects through them reads the tables from there.
++extern "C" {
++extern void* d4r_split_original[d4r_split::MaxSlots];  // the used attribute belongs to its definition
++extern void* d4r_split_thunks[d4r_split::MaxSlots];
++void* d4r_split_target(void* self);
++}
++#else
++extern "C" {
++// the original methods, by vtable slot (used by the stubs below)
++__attribute__((used)) void* d4r_split_original[d4r_split::MaxSlots] = {};
++extern void* d4r_split_thunks[d4r_split::MaxSlots];
++
++// The list a call on `self` records into: the second part while `self` is split, otherwise `self`.
++__attribute__((used)) void* d4r_split_target(void* self)
++{
++    using namespace d4r_split::detail;
++    if (active.load(std::memory_order_acquire) == 0)
++        return self;
++    for (auto& split : splits)
++        if (split.list.load(std::memory_order_acquire) == self && split.recording.load(std::memory_order_acquire))
++            return split.second;
++    return self;
++}
++}
++
++// One stub per redirected slot: the four argument registers and xmm0-3 survive the lookup, the stack arguments are
++// untouched (the stub leaves its frame before the jump), and rcx becomes the list that records.
++__asm__(R"(
++    .att_syntax
++    .text
++    .irp idx,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85
++    .globl d4r_split_thunk_\idx
++d4r_split_thunk_\idx:
++    push %rcx
++    push %rdx
++    push %r8
++    push %r9
++    sub $0x68, %rsp
++    movdqu %xmm0, 0x20(%rsp)
++    movdqu %xmm1, 0x30(%rsp)
++    movdqu %xmm2, 0x40(%rsp)
++    movdqu %xmm3, 0x50(%rsp)
++    call d4r_split_target
++    movdqu 0x20(%rsp), %xmm0
++    movdqu 0x30(%rsp), %xmm1
++    movdqu 0x40(%rsp), %xmm2
++    movdqu 0x50(%rsp), %xmm3
++    add $0x68, %rsp
++    pop %r9
++    pop %r8
++    pop %rdx
++    pop %rcx
++    mov %rax, %rcx
++    jmp *(d4r_split_original + 8 * \idx)(%rip)
++    .endr
++    .section .rdata,"dr"
++    .p2align 3
++    .globl d4r_split_thunks
++d4r_split_thunks:
++    .rept 11
++    .quad 0
++    .endr
++    .irp idx,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85
++    .quad d4r_split_thunk_\idx
++    .endr
++    .text
++)");
++#endif  // D4R_D3D12_SPLIT_DECL
++
++namespace d4r_split {
++namespace detail {
++inline Split* find(ID3D12GraphicsCommandList* list)
++{
++    for (auto& split : splits)
++        if (split.list.load(std::memory_order_acquire) == list)
++            return &split;
++    return nullptr;
++}
++
++// mutex held
++inline void finish(Split& split, bool executed)
++{
++    split.recording.store(false, std::memory_order_release);
++    split.list.store(nullptr, std::memory_order_release);
++    active.fetch_sub(1, std::memory_order_acq_rel);
++    if (split.done)
++        split.done(split.owner, executed);
++    split.done = nullptr;
++    split.beforeSecond = nullptr;
++    split.beforeOwner = nullptr;
++}
++
++inline HRESULT STDMETHODCALLTYPE close_hook(ID3D12GraphicsCommandList* list)
++{
++    HRESULT second = S_OK;
++    {
++        std::lock_guard<std::mutex> lock(mutex);
++        if (Split* split = find(list); split != nullptr && split->recording.load())
++        {
++            split->recording.store(false, std::memory_order_release);
++            second = close(split->second);
++            split->closed = true;
++        }
++    }
++    const HRESULT first = close(list);
++    return FAILED(second) ? second : first;
++}
++
++// a split list reset before it was executed: its second part is dropped with it
++inline void reset_hook(ID3D12GraphicsCommandList* list)
++{
++    std::lock_guard<std::mutex> lock(mutex);
++    Split* split = find(list);
++    if (split == nullptr)
++        return;
++    if (split->recording.load())
++        close(split->second);
++    finish(*split, false);
++}
++
++inline bool execute_hook(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists,
++                         d4r_submit::detail::Execute execute)
++{
++    if (active.load(std::memory_order_acquire) == 0)
++        return false;
++    std::lock_guard<std::mutex> lock(mutex);
++    std::vector<Split*> found(count, nullptr);
++    bool any = false;
++    for (UINT i = 0; i < count; ++i)
++    {
++        Split* split = find(static_cast<ID3D12GraphicsCommandList*>(lists[i]));
++        if (split != nullptr && split->closed)
++        {
++            found[i] = split;
++            any = true;
++        }
++    }
++    if (!any)
++        return false;
++    std::vector<ID3D12CommandList*> chunk;
++    std::vector<Split*> retiring;
++    for (UINT i = 0; i < count; ++i)
++    {
++        chunk.push_back(lists[i]);
++        if (Split* split = found[i])
++        {
++            execute(queue, static_cast<UINT>(chunk.size()), chunk.data());
++            if (split->beforeSecond != nullptr)
++            {
++                split->beforeSecond(split->beforeOwner, queue);
++                // the hook's work is done: satisfy the wait below from the CPU (a split without a hook is completed
++                // by its owner's own signal, as before)
++                if (split->fence != nullptr)
++                    split->fence->Signal(split->value);
++            }
++            queue->Wait(split->fence, split->value);
++            chunk.assign(1, split->second);
++            retiring.push_back(split);
++        }
++    }
++    execute(queue, static_cast<UINT>(chunk.size()), chunk.data());
++    for (Split* split : retiring)
++    {
++        if (split->retire != nullptr)
++            queue->Signal(split->retire, split->retireValue);
++        finish(*split, true);
++    }
++    return true;
++}
++} // namespace detail
++
++inline bool installed() { return detail::ready.load(); }
++
++// Replaces the recording methods of the command lists `device` creates (once per process). Needs the submission
++// hooks. False: lists cannot be split (the reason in *failure).
++inline bool install(ID3D12Device* device, const char** failure = nullptr)
++{
++    using namespace detail;
++    static std::mutex installMutex;
++    std::lock_guard<std::mutex> lock(installMutex);
++    if (ready.load())
++        return true;
++    if (!d4r_submit::install(device, failure))
++        return false;
++    ID3D12CommandAllocator* allocator = nullptr;
++    ID3D12GraphicsCommandList* list = nullptr;
++    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) ||
++        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, nullptr, IID_PPV_ARGS(&list))))
++    {
++        if (allocator) allocator->Release();
++        if (failure) *failure = "the probe list could not be created";
++        return false;
++    }
++    // the vtable's length is that of the newest interface the runtime implements; patching past it would
++    // corrupt whatever follows, so a newer interface this header does not know stops at the last one it does
++    static const GUID list10 = {0x7013c015, 0xd161, 0x4b63, {0xa0, 0x8c, 0x23, 0x85, 0x52, 0xdd, 0x8a, 0xcc}};
++    static const GUID list9 = {0x34ed2808, 0xffe6, 0x4c2b, {0xb1, 0x1a, 0xca, 0xbd, 0x2b, 0x0c, 0x59, 0xe1}};
++    static const GUID list8 = {0xee936ef9, 0x599d, 0x4d28, {0x93, 0x8e, 0x23, 0xc4, 0xad, 0x05, 0xce, 0x51}};
++    const struct { const GUID* iid; size_t slots; } versions[] = {
++        {&list10, 86}, {&list9, 84}, {&list8, 82}, {&__uuidof(ID3D12GraphicsCommandList7), 81},
++        {&__uuidof(ID3D12GraphicsCommandList6), 80}, {&__uuidof(ID3D12GraphicsCommandList5), 79},
++        {&__uuidof(ID3D12GraphicsCommandList4), 77}, {&__uuidof(ID3D12GraphicsCommandList3), 68},
++        {&__uuidof(ID3D12GraphicsCommandList2), 67}, {&__uuidof(ID3D12GraphicsCommandList1), 66}};
++    size_t slots = 60;
++    for (const auto& version : versions)
++    {
++        IUnknown* newer = nullptr;
++        if (SUCCEEDED(list->QueryInterface(*version.iid, reinterpret_cast<void**>(&newer))))
++        {
++            newer->Release();
++            slots = version.slots;
++            break;
++        }
++    }
++    void** vtable = *reinterpret_cast<void***>(list);
++    bool ok = true;
++    void* closeOriginal = nullptr;
++    ok = d4r_submit::detail::patch(vtable, CloseSlot, reinterpret_cast<void*>(&close_hook), &closeOriginal);
++    if (closeOriginal) close = reinterpret_cast<Close>(closeOriginal);
++    for (size_t slot = FirstRedirected; ok && slot < slots; ++slot)
++    {
++        void* original = nullptr;
++        ok = d4r_submit::detail::patch(vtable, slot, d4r_split_thunks[slot], &original);
++        if (original) d4r_split_original[slot] = original;
++        ok = ok && d4r_split_original[slot] != nullptr;
++    }
++    list->Close();
++    list->Release();
++    allocator->Release();
++    if (!ok || close == nullptr)
++    {
++        if (failure) *failure = "the command list vtable could not be patched";
++        return false;
++    }
++    auto& s = d4r_submit::detail::state();
++    s.splitExecute = &execute_hook;
++    s.splitReset = &reset_hook;
++    ready = true;
++    return true;
++}
++
++// From now on what is recorded into `list` goes into `second` (open, of the same type). When `list` is executed,
++// `second` follows it on the same queue once `fence` reaches `value`, and `retire` is then signalled to
++// `retireValue` behind it. `done(owner, executed)` reports the outcome once: executed, or discarded (reset before it
++// was executed). `beforeSecond(beforeOwner, queue)` runs between the two parts (see Split). False: no split slot was
++// free (nothing changes).
++inline bool begin(ID3D12GraphicsCommandList* list, ID3D12GraphicsCommandList* second, ID3D12Fence* fence,
++                  uint64_t value, ID3D12Fence* retire, uint64_t retireValue, void (*done)(void*, bool), void* owner,
++                  void (*beforeSecond)(void*, ID3D12CommandQueue*) = nullptr, void* beforeOwner = nullptr)
++{
++    using namespace detail;
++    if (!ready.load())
++        return false;
++    std::lock_guard<std::mutex> lock(mutex);
++    if (find(list) != nullptr)
++        return false;
++    for (auto& split : splits)
++    {
++        if (split.list.load() != nullptr)
++            continue;
++        split.second = second;
++        split.fence = fence;
++        split.value = value;
++        split.retire = retire;
++        split.retireValue = retireValue;
++        split.closed = false;
++        split.done = done;
++        split.owner = owner;
++        split.beforeSecond = beforeSecond;
++        split.beforeOwner = beforeOwner;
++        split.recording.store(true, std::memory_order_release);
++        split.list.store(list, std::memory_order_release);
++        active.fetch_add(1, std::memory_order_acq_rel);
++        return true;
++    }
++    return false;
++}
++} // namespace d4r_split
+diff --git a/src/dll/d4r_d3d12_submit.h b/src/dll/d4r_d3d12_submit.h
+new file mode 100644
+index 0000000..f69f7d1
+--- /dev/null
++++ b/src/dll/d4r_d3d12_submit.h
+@@ -0,0 +1,161 @@
++// From d4r (github.com/countervolts/d4r, tools/d4r_d3d12_submit.h), GPL-3.0-only.
++// d4r_d3d12_submit.h: tells the native D3D12 engine whether, and when, the game executes a command list it recorded
++// into (engine/d3d12/runtime_d3d12.h: every recording is reported once, submitted with a fence value or discarded).
++// NGX hands the shim an open command list and never says what becomes of it, so ID3D12CommandQueue's
++// ExecuteCommandLists and ID3D12GraphicsCommandList's Reset are hooked in their vtables (shared by every queue and
++// list the game's device creates): after a batch that holds a tracked list the hook signals d4r's own fence on that
++// queue, and a tracked list reset before it was executed was discarded. Without the hooks (install failed) or for a
++// recording no hook saw, the shim reports it submitted without a fence (the engine then keeps its resources for a
++// fixed number of frames).
++#pragma once
++#include <d3d12.h>
++#include <atomic>
++#include <cstdint>
++#include <mutex>
++#include <unordered_map>
++#include <vector>
++
++namespace d4r_submit {
++struct Pending {
++    void* owner = nullptr;
++    void (*submitted)(void* owner, ID3D12Fence* fence, uint64_t value, uint64_t timestampFrequency) = nullptr;
++    void (*discarded)(void* owner) = nullptr;
++};
++
++namespace detail {
++using Execute = void(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
++using Reset = HRESULT(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12CommandAllocator*, ID3D12PipelineState*);
++// vtable slots: IUnknown (3), ID3D12Object (4), ID3D12DeviceChild (1), then ID3D12CommandQueue's
++// UpdateTileMappings, CopyTileMappings, ExecuteCommandLists; ID3D12CommandList's GetType, then
++// ID3D12GraphicsCommandList's Close, Reset
++constexpr size_t ExecuteSlot = 10, ResetSlot = 10;
++struct State {
++    std::mutex mutex;
++    std::unordered_map<ID3D12CommandList*, std::vector<Pending>> pending;
++    ID3D12Fence* fence = nullptr;
++    uint64_t value = 0;
++    Execute execute = nullptr;
++    Reset reset = nullptr;
++    std::atomic<bool> installed{false};
++    // d4r_d3d12_split.h: executes a batch holding a split list itself (true), and sees every Reset
++    std::atomic<bool (*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*, Execute)> splitExecute{nullptr};
++    std::atomic<void (*)(ID3D12GraphicsCommandList*)> splitReset{nullptr};
++};
++inline State& state() { static State s; return s; }
++
++inline bool patch(void** vtable, size_t slot, void* hook, void** original) {
++    DWORD protection = 0;
++    if (!VirtualProtect(&vtable[slot], sizeof(void*), PAGE_EXECUTE_READWRITE, &protection)) return false;
++    if (vtable[slot] != hook) { *original = vtable[slot]; vtable[slot] = hook; }
++    VirtualProtect(&vtable[slot], sizeof(void*), protection, &protection);
++    FlushInstructionCache(GetCurrentProcess(), &vtable[slot], sizeof(void*));
++    return true;
++}
++
++inline void STDMETHODCALLTYPE execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists) {
++    State& s = state();
++    const auto split = s.splitExecute.load();
++    if (split == nullptr || !split(queue, count, lists, s.execute))
++        s.execute(queue, count, lists);
++    std::vector<Pending> done;
++    uint64_t value = 0, frequency = 0;
++    {
++        std::lock_guard<std::mutex> lock(s.mutex);
++        if (s.pending.empty()) return;
++        for (UINT i = 0; i < count; ++i) {
++            auto it = s.pending.find(lists[i]);
++            if (it == s.pending.end()) continue;
++            done.insert(done.end(), it->second.begin(), it->second.end());
++            s.pending.erase(it);
++        }
++        if (done.empty()) return;
++        queue->GetTimestampFrequency(&frequency);
++        value = ++s.value;
++        // after the batch on the same queue: reached once every list of it has executed
++        if (FAILED(queue->Signal(s.fence, value))) value = 0;
++    }
++    for (const Pending& p : done) p.submitted(p.owner, value ? s.fence : nullptr, value, frequency);
++}
++
++inline HRESULT STDMETHODCALLTYPE reset(ID3D12GraphicsCommandList* list, ID3D12CommandAllocator* allocator,
++                                       ID3D12PipelineState* pipeline) {
++    State& s = state();
++    std::vector<Pending> dropped;
++    {
++        std::lock_guard<std::mutex> lock(s.mutex);
++        auto it = s.pending.find(list);
++        if (it != s.pending.end()) { dropped = std::move(it->second); s.pending.erase(it); }
++    }
++    for (const Pending& p : dropped) p.discarded(p.owner);
++    if (const auto split = s.splitReset.load()) split(list);
++    return s.reset(list, allocator, pipeline);
++}
++} // namespace detail
++
++// Hooks the vtables of the queues and lists `device` creates (once per process). False: recordings cannot be
++// tracked (see the header comment).
++inline bool install(ID3D12Device* device, const char** failure = nullptr) {
++    using namespace detail;
++    State& s = state();
++    static std::mutex installMutex;
++    std::lock_guard<std::mutex> lock(installMutex);
++    if (s.installed.load()) return true;
++    ID3D12CommandQueue* queue = nullptr;
++    ID3D12CommandAllocator* allocator = nullptr;
++    ID3D12GraphicsCommandList* list = nullptr;
++    D3D12_COMMAND_QUEUE_DESC desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
++    bool ok = SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&s.fence))) &&
++              SUCCEEDED(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue))) &&
++              SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) &&
++              SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, nullptr, IID_PPV_ARGS(&list)));
++    if (!ok && failure) *failure = "the probe queue or list could not be created";
++    if (ok) {
++        void* executeOriginal = nullptr; void* resetOriginal = nullptr;
++        ok = patch(*reinterpret_cast<void***>(queue), ExecuteSlot, reinterpret_cast<void*>(&detail::execute), &executeOriginal) &&
++             patch(*reinterpret_cast<void***>(list), ResetSlot, reinterpret_cast<void*>(&detail::reset), &resetOriginal);
++        if (ok) {
++            if (executeOriginal) s.execute = reinterpret_cast<Execute>(executeOriginal);
++            if (resetOriginal) s.reset = reinterpret_cast<Reset>(resetOriginal);
++            ok = s.execute && s.reset;
++        }
++        if (!ok && failure) *failure = "the vtables could not be patched";
++    }
++    if (list) { list->Close(); list->Release(); }
++    if (allocator) allocator->Release();
++    if (queue) queue->Release();
++    if (!ok && s.fence) { s.fence->Release(); s.fence = nullptr; }
++    s.installed = ok;
++    return ok;
++}
++inline bool installed() { return detail::state().installed.load(); }
++
++// The recording just made into `list`: reported through `p` when the list is executed or reset.
++inline void track(ID3D12GraphicsCommandList* list, const Pending& p) {
++    detail::State& s = detail::state();
++    std::lock_guard<std::mutex> lock(s.mutex);
++    s.pending[list].push_back(p);
++}
++// Takes back an owner's unreported recordings (a feature being released); returns how many there were.
++inline size_t forget(void* owner) {
++    detail::State& s = detail::state();
++    std::lock_guard<std::mutex> lock(s.mutex);
++    size_t count = 0;
++    for (auto it = s.pending.begin(); it != s.pending.end();) {
++        auto& v = it->second;
++        for (auto p = v.begin(); p != v.end();) {
++            if (p->owner == owner) { p = v.erase(p); ++count; } else ++p;
++        }
++        it = v.empty() ? s.pending.erase(it) : std::next(it);
++    }
++    return count;
++}
++// Whether `owner` has a recording no hook has reported yet.
++inline bool pending(void* owner) {
++    detail::State& s = detail::state();
++    std::lock_guard<std::mutex> lock(s.mutex);
++    for (auto& entry : s.pending)
++        for (auto& p : entry.second)
++            if (p.owner == owner) return true;
++    return false;
++}
++} // namespace d4r_submit
+diff --git a/src/dll/hip_dyn.cpp b/src/dll/hip_dyn.cpp
+new file mode 100644
+index 0000000..2af598b
+--- /dev/null
++++ b/src/dll/hip_dyn.cpp
+@@ -0,0 +1,50 @@
++// m4r: run-time loading of AMD's HIP runtime (see hip_dyn.h).
++// SPDX-License-Identifier: GPL-3.0-only
++#include "hip_dyn.h"
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <windows.h>
++#include <cstring>
++#include <mutex>
++#include <string>
++
++namespace hipdyn {
++
++static Api g_api;
++static const Api* g_loaded = nullptr;
++static std::string g_why, g_arch;
++
++const Api* load(const char** why) {
++    static std::once_flag once;
++    std::call_once(once, [] {
++        // the driver installs both; amdhip64_7 first (ROCm 7 runtime), amdhip64_6 for older drivers. M4R_HIP_DLL overrides.
++        const char* names[] = {getenv("M4R_HIP_DLL"), "amdhip64_7.dll", "amdhip64_6.dll"};
++        HMODULE m = nullptr;
++        for (const char* n : names)
++            if (n && *n && (m = LoadLibraryA(n)) != nullptr) break;
++        if (!m) { g_why = "no HIP runtime (amdhip64_7.dll / amdhip64_6.dll) found: install a current AMD Software driver"; return; }
++        g_api.module = m;
++#define HIPDYN_LOAD(name, ret, args) \
++        g_api.name = reinterpret_cast<ret (*) args>(GetProcAddress(m, #name)); \
++        if (!g_api.name) { g_why = std::string("the HIP runtime has no ") + #name; return; }
++        HIPDYN_FUNCS(HIPDYN_LOAD)
++#undef HIPDYN_LOAD
++        hipError_t e = g_api.hipInit(0);
++        int n = 0;
++        if (e || g_api.hipGetDeviceCount(&n) || n < 1) { g_why = std::string("hipInit: ") + g_api.err(e) + " (no HIP device)"; return; }
++        if ((e = g_api.hipSetDevice(0)) != 0) { g_why = std::string("hipSetDevice: ") + g_api.err(e); return; }
++        alignas(16) unsigned char props[kDevicePropBytes + 1024] = {};
++        if ((e = g_api.hipGetDevicePropertiesR0600(props, 0)) != 0) { g_why = std::string("hipGetDeviceProperties: ") + g_api.err(e); return; }
++        const char* a = reinterpret_cast<const char*>(props + kGcnArchNameOffset);
++        g_arch.assign(a, strnlen(a, 255));
++        g_arch = g_arch.substr(0, g_arch.find(':'));
++        g_loaded = &g_api;
++    });
++    if (why) *why = g_why.c_str();
++    return g_loaded;
++}
++
++const char* deviceArch() { return load() ? g_arch.c_str() : ""; }
++
++} // namespace hipdyn
+diff --git a/src/dll/hip_dyn.h b/src/dll/hip_dyn.h
+new file mode 100644
+index 0000000..d2e9ebf
+--- /dev/null
++++ b/src/dll/hip_dyn.h
+@@ -0,0 +1,136 @@
++// m4r: the HIP runtime functions m4r uses on Windows, loaded at run time from AMD's driver (amdhip64_7.dll, else amdhip64_6.dll).
++// The declarations repeat the ABI of the ROCm 6/7 headers (hip_runtime_api.h, driver_types.h, texture_types.h) so the DLL builds
++// without the HIP SDK and never imports the HIP runtime at load time (d4r: loading it next to OptiScaler's hooks before the game's
++// first frame can hang the GPU).
++// SPDX-License-Identifier: GPL-3.0-only
++#pragma once
++#include <cstddef>
++#include <cstdint>
++
++namespace hipdyn {
++
++typedef int hipError_t;   // 0 = hipSuccess
++typedef struct ihipStream_t* hipStream_t;
++typedef struct ihipModule_t* hipModule_t;
++typedef struct ihipModuleSymbol_t* hipFunction_t;
++typedef struct ihipEvent_t* hipEvent_t;
++typedef void* hipExternalMemory_t;
++typedef void* hipExternalSemaphore_t;
++typedef struct __hip_texture* hipTextureObject_t;
++
++enum hipMemcpyKind { hipMemcpyHostToHost = 0, hipMemcpyHostToDevice = 1, hipMemcpyDeviceToHost = 2, hipMemcpyDeviceToDevice = 3, hipMemcpyDefault = 4 };
++enum hipChannelFormatKind { hipChannelFormatKindSigned = 0, hipChannelFormatKindUnsigned = 1, hipChannelFormatKindFloat = 2, hipChannelFormatKindNone = 3 };
++struct hipChannelFormatDesc { int x, y, z, w; hipChannelFormatKind f; };
++enum hipResourceType { hipResourceTypeArray = 0, hipResourceTypeMipmappedArray = 1, hipResourceTypeLinear = 2, hipResourceTypePitch2D = 3 };
++struct hipResourceDesc {
++    hipResourceType resType;
++    union {
++        struct { void* array; } array;
++        struct { void* mipmap; } mipmap;
++        struct { void* devPtr; hipChannelFormatDesc desc; size_t sizeInBytes; } linear;
++        struct { void* devPtr; hipChannelFormatDesc desc; size_t width, height, pitchInBytes; } pitch2D;
++    } res;
++};
++enum hipTextureAddressMode { hipAddressModeWrap = 0, hipAddressModeClamp = 1, hipAddressModeMirror = 2, hipAddressModeBorder = 3 };
++enum hipTextureFilterMode { hipFilterModePoint = 0, hipFilterModeLinear = 1 };
++enum hipTextureReadMode { hipReadModeElementType = 0, hipReadModeNormalizedFloat = 1 };
++struct hipTextureDesc {
++    hipTextureAddressMode addressMode[3];
++    hipTextureFilterMode filterMode;
++    hipTextureReadMode readMode;
++    int sRGB;
++    float borderColor[4];
++    int normalizedCoords;
++    unsigned int maxAnisotropy;
++    hipTextureFilterMode mipmapFilterMode;
++    float mipmapLevelBias, minMipmapLevelClamp, maxMipmapLevelClamp;
++};
++enum hipExternalMemoryHandleType { hipExternalMemoryHandleTypeOpaqueWin32 = 2, hipExternalMemoryHandleTypeD3D12Heap = 4, hipExternalMemoryHandleTypeD3D12Resource = 5 };
++struct hipExternalMemoryHandleDesc {
++    hipExternalMemoryHandleType type;
++    union { int fd; struct { void* handle; const void* name; } win32; const void* nvSciBufObject; } handle;
++    unsigned long long size;
++    unsigned int flags;
++    unsigned int reserved[16];
++};
++struct hipExternalMemoryBufferDesc { unsigned long long offset, size; unsigned int flags; unsigned int reserved[16]; };
++enum hipExternalSemaphoreHandleType { hipExternalSemaphoreHandleTypeD3D12Fence = 4, hipExternalSemaphoreHandleTypeTimelineSemaphoreWin32 = 10 };
++struct hipExternalSemaphoreHandleDesc {
++    hipExternalSemaphoreHandleType type;
++    union { int fd; struct { void* handle; const void* name; } win32; const void* NvSciSyncObj; } handle;
++    unsigned int flags;
++    unsigned int reserved[16];
++};
++struct hipExternalSemaphoreSignalParams {
++    struct { struct { unsigned long long value; } fence; union { void* fence; unsigned long long reserved; } nvSciSync;
++             struct { unsigned long long key; } keyedMutex; unsigned int reserved[12]; } params;
++    unsigned int flags;
++    unsigned int reserved[16];
++};
++struct hipExternalSemaphoreWaitParams {
++    struct { struct { unsigned long long value; } fence; union { void* fence; unsigned long long reserved; } nvSciSync;
++             struct { unsigned long long key; unsigned int timeoutMs; } keyedMutex; unsigned int reserved[10]; } params;
++    unsigned int flags;
++    unsigned int reserved[16];
++};
++
++constexpr size_t kDevicePropBytes = 1472, kGcnArchNameOffset = 1160;   // hipDeviceProp_tR0600 (ROCm 6.0 - 7.x)
++constexpr uint32_t hipExtAnyOrderLaunch = 1, hipStreamNonBlocking = 1, hipEventDisableTiming = 2;
++
++#define HIPDYN_FUNCS(X) \
++    X(hipInit, hipError_t, (unsigned)) \
++    X(hipGetDeviceCount, hipError_t, (int*)) \
++    X(hipSetDevice, hipError_t, (int)) \
++    X(hipGetDevicePropertiesR0600, hipError_t, (void*, int)) \
++    X(hipDeviceGetPCIBusId, hipError_t, (char*, int, int)) \
++    X(hipGetErrorString, const char*, (hipError_t)) \
++    X(hipMalloc, hipError_t, (void**, size_t)) \
++    X(hipFree, hipError_t, (void*)) \
++    X(hipMemcpy, hipError_t, (void*, const void*, size_t, hipMemcpyKind)) \
++    X(hipMemcpyAsync, hipError_t, (void*, const void*, size_t, hipMemcpyKind, hipStream_t)) \
++    X(hipMemcpy2DAsync, hipError_t, (void*, size_t, const void*, size_t, size_t, size_t, hipMemcpyKind, hipStream_t)) \
++    X(hipMemsetAsync, hipError_t, (void*, int, size_t, hipStream_t)) \
++    X(hipMemsetD32Async, hipError_t, (void*, int, size_t, hipStream_t)) \
++    X(hipHostMalloc, hipError_t, (void**, size_t, unsigned)) \
++    X(hipHostFree, hipError_t, (void*)) \
++    X(hipStreamCreateWithFlags, hipError_t, (hipStream_t*, unsigned)) \
++    X(hipStreamDestroy, hipError_t, (hipStream_t)) \
++    X(hipStreamSynchronize, hipError_t, (hipStream_t)) \
++    X(hipDeviceSynchronize, hipError_t, ()) \
++    X(hipEventCreateWithFlags, hipError_t, (hipEvent_t*, unsigned)) \
++    X(hipEventDestroy, hipError_t, (hipEvent_t)) \
++    X(hipEventRecord, hipError_t, (hipEvent_t, hipStream_t)) \
++    X(hipEventSynchronize, hipError_t, (hipEvent_t)) \
++    X(hipEventQuery, hipError_t, (hipEvent_t)) \
++    X(hipEventElapsedTime, hipError_t, (float*, hipEvent_t, hipEvent_t)) \
++    X(hipModuleLoadData, hipError_t, (hipModule_t*, const void*)) \
++    X(hipModuleUnload, hipError_t, (hipModule_t)) \
++    X(hipModuleGetFunction, hipError_t, (hipFunction_t*, hipModule_t, const char*)) \
++    X(hipFuncGetAttribute, hipError_t, (int*, int, hipFunction_t)) \
++    X(hipModuleGetGlobal, hipError_t, (void**, size_t*, hipModule_t, const char*)) \
++    X(hipModuleLaunchKernel, hipError_t, (hipFunction_t, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, hipStream_t, void**, void**)) \
++    X(hipExtModuleLaunchKernel, hipError_t, (hipFunction_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, size_t, hipStream_t, void**, void**, hipEvent_t, hipEvent_t, uint32_t)) \
++    X(hipCreateTextureObject, hipError_t, (hipTextureObject_t*, const hipResourceDesc*, const hipTextureDesc*, const void*)) \
++    X(hipDestroyTextureObject, hipError_t, (hipTextureObject_t)) \
++    X(hipImportExternalMemory, hipError_t, (hipExternalMemory_t*, const hipExternalMemoryHandleDesc*)) \
++    X(hipExternalMemoryGetMappedBuffer, hipError_t, (void**, hipExternalMemory_t, const hipExternalMemoryBufferDesc*)) \
++    X(hipDestroyExternalMemory, hipError_t, (hipExternalMemory_t)) \
++    X(hipImportExternalSemaphore, hipError_t, (hipExternalSemaphore_t*, const hipExternalSemaphoreHandleDesc*)) \
++    X(hipSignalExternalSemaphoresAsync, hipError_t, (const hipExternalSemaphore_t*, const hipExternalSemaphoreSignalParams*, unsigned, hipStream_t)) \
++    X(hipWaitExternalSemaphoresAsync, hipError_t, (const hipExternalSemaphore_t*, const hipExternalSemaphoreWaitParams*, unsigned, hipStream_t)) \
++    X(hipDestroyExternalSemaphore, hipError_t, (hipExternalSemaphore_t))
++
++struct Api {
++#define HIPDYN_MEMBER(name, ret, args) ret (*name) args = nullptr;
++    HIPDYN_FUNCS(HIPDYN_MEMBER)
++#undef HIPDYN_MEMBER
++    void* module = nullptr;
++    const char* err(hipError_t e) const { return hipGetErrorString ? hipGetErrorString(e) : "HIP error"; }
++};
++
++// Loads the runtime once (thread-safe). Null when no HIP runtime is installed or a function is missing; *why says which.
++const Api* load(const char** why = nullptr);
++// The LLVM target of HIP device 0 ("gfx1101"), without feature suffixes (":sramecc-:xnack-"); empty on failure.
++const char* deviceArch();
++
++} // namespace hipdyn

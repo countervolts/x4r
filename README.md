@@ -57,6 +57,22 @@ GPU; other AMD GPUs get the stock dot4 kernels. The RDNA4 set is untested on
 RDNA4 hardware (it matches the RDNA3 output byte-for-byte on an RX 7700 XT).
 Details: [packaging/README.txt](packaging/README.txt).
 
+## Native Windows (HIP)
+
+On Windows the shim runs the kernels on AMD's HIP runtime (part of the Adrenalin
+driver) instead of as DXIL: `x4r.ini` `Backend = hip` and `<x4r dir>\hip\<kernel
+hash>.hsaco` code objects built by `x4r/tools/build_hip.py --gpu gfx1101 --wmma`
+(x4rwave → `hlsl2hip.py` → AMD's LLVM). XeSS' dispatches are collected per command
+list and run as one HIP batch at a split of the game's list (D3D12 fence hand-off);
+XeSS' heaps are shared with HIP, its textures live in HIP, and the game's textures
+pass through shared linear buffers. x4r.asi spoofs an Intel adapter to libxess.dll
+only. RDNA3/RDNA4 only (WMMA): the dot4 translation spills far too much on RDNA2.
+
+Offline (`x4r/src/bench-upscale.cpp`, RX 7700 XT, 1280×720 → 2560×1440): about
+**4.1 ms** per frame including the hand-off; the WMMA and dot4 code objects give
+byte-identical output, 34.4 dB against XeSS's own DP4a path on the bench's static
+pattern. Not yet tested in a game.
+
 ## Build the tools
 
 The development environment uses Linux, LLVM **23.1.1**, a C++20-capable compiler

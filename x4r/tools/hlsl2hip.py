@@ -72,7 +72,7 @@ def convert(text):
     return f'#include "{os.path.basename(PRELUDE)}"\n' + '\n'.join(out) + '\n'
 
 
-def build(hip, gpu, hsaco, llvm=None):
+def build(hip, gpu, hsaco, llvm=None, extra=()):
     def tool(name):
         for d in [llvm] if llvm else []:
             for n in (name + '.exe', name):
@@ -80,10 +80,10 @@ def build(hip, gpu, hsaco, llvm=None):
                     return os.path.join(d, n)
         return name
     # device-only, unbundled: clang links the code object itself
-    subprocess.run([tool('clang'), '-x', 'hip', '--cuda-device-only', '--no-gpu-bundle-output', f'--offload-arch={gpu}', '-nogpulib', '-nogpuinc',
+    return subprocess.run([tool('clang'), '-x', 'hip', '--cuda-device-only', '--no-gpu-bundle-output', f'--offload-arch={gpu}', '-nogpulib', '-nogpuinc',
                     '-O3', '-std=c++17', '-ffp-contract=off', '-fgpu-flush-denormals-to-zero',   # fp32 denormals flushed, as CM and D3D12 do
-                    f'-I{os.path.dirname(PRELUDE)}', '-Wno-deprecated-builtins', '-c', hip, '-o', hsaco],
-                   check=True)
+                    f'-I{os.path.dirname(PRELUDE)}', '-Wno-deprecated-builtins', *extra, '-c', hip, '-o', hsaco],
+                   check=True, capture_output=bool(extra), text=True)
 
 
 def main():

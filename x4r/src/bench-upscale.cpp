@@ -26,6 +26,10 @@ int main(int argc,char** argv) try {
     const bool quality=strcmp(argv[3],"quality")==0;
     if(!quality && strcmp(argv[3],"performance")!=0) throw std::runtime_error("Unknown preset");
     UINT IW=0,IH=0;
+    if(const char* asi=getenv("X4R_ASI")) { // native Windows: load x4r.asi first, as OptiScaler does (vendor id for XeSS, shim path)
+        HMODULE m=LoadLibraryA(asi); if(!m) throw std::runtime_error("cannot load X4R_ASI");
+        if(auto f=(void(*)())GetProcAddress(m,"InitializeASI")) f();
+    }
     ComPtr<IDXGIFactory4> factory; hr(CreateDXGIFactory2(0,IID_PPV_ARGS(&factory)));
     ComPtr<IDXGIAdapter1> adapter; hr(factory->EnumAdapters1(0,&adapter));
     DXGI_ADAPTER_DESC1 ad; hr(adapter->GetDesc1(&ad));
@@ -75,7 +79,7 @@ int main(int argc,char** argv) try {
     }
     upload->Unmap(0,nullptr);
     std::vector<double> timings;
-    constexpr unsigned warmup=256,frames=1024;
+    const unsigned frames=getenv("BENCH_FRAMES")?(std::max)(2u,(unsigned)atoi(getenv("BENCH_FRAMES"))):1024,warmup=frames/4; // BENCH_FRAMES: fewer frames
     for(unsigned frame=0;frame<frames;++frame) {
         hr(alloc->Reset());hr(cmd->Reset(alloc.Get(),nullptr));
         if(!frame) {
@@ -94,6 +98,19 @@ int main(int argc,char** argv) try {
         D3D12_RANGE tr={0,16};hr(timingRead->Map(0,&tr,&ptr));
         UINT64 ticks[2];memcpy(ticks,ptr,16);timingRead->Unmap(0,&empty);
         if(frame>=warmup) timings.push_back((ticks[1]-ticks[0])*1000.0/frequency);
+    }
+    if(const char* outPath=getenv("BENCH_OUT")) { // raw RGBA16F rows of the last frame's output (W x H x 8 bytes), for comparisons
+        hr(alloc->Reset());hr(cmd->Reset(alloc.Get(),nullptr));
+        barrier(output.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION a={},b={};a.pResource=read.Get();a.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;a.PlacedFootprint=of;b.pResource=output.Get();b.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        cmd->CopyTextureRegion(&a,0,0,0,&b,nullptr);
+        barrier(output.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        hr(cmd->Close());ID3D12CommandList* lists[]={cmd.Get()};queue->ExecuteCommandLists(1,lists);wait();
+        D3D12_RANGE rr={0,(SIZE_T)ob};hr(read->Map(0,&rr,&ptr));
+        FILE* f=fopen(outPath,"wb"); if(!f) throw std::runtime_error("cannot write BENCH_OUT");
+        for(UINT y=0;y<H;++y) fwrite((char*)ptr+of.Offset+y*of.Footprint.RowPitch,1,W*8,f);
+        fclose(f);read->Unmap(0,&empty);
+        printf("output written to %s\n",outPath);fflush(stdout);
     }
     std::sort(timings.begin(),timings.end());double sum=0;for(double t:timings)sum+=t;
     printf("GPU XeSS span: median=%.6f ms mean=%.6f ms p95=%.6f ms (%zu frames, %u warmup)\n",timings[timings.size()/2],sum/timings.size(),timings[timings.size()*95/100],timings.size(),warmup);fflush(stdout);
